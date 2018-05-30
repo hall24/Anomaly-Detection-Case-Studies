@@ -1,0 +1,474 @@
+---
+title: "HW1 SP500_EDA"
+author: "Elijah Hall"
+date: "May 24, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## HW#1 S&P500 EDA
+
+In this assignment, you will conduct an exhaustive Exploratory Data Analysis (EDA) on the provided dataset. You will create new features and structure your EDA for different leads with sub-sections. Write a short summary of the features that you built and insight that they afforded at the end of each sub-section. Please submit in the HTML format.  
+
+### Merge all the files into one master
+
+  Combine all the data to make it easier to create features and apply them accross all stocks.
+
+```{r }
+#install.packages("tidyverse")
+library(tidyverse)
+#install.packages("data.table")
+library(data.table)
+#install.packages("TTR")
+library(TTR)
+library(zoo)
+#install.packages("cumstats")
+library(cumstats)
+library(knitr)
+library(rmarkdown)
+
+```
+
+```{r eval = FALSE}
+#read in data
+stock_names <- read.table('SP500 Stocks.txt', sep=",", header=T)
+
+# option two to merge all data files
+data_path <- "C:/Users/usmc_/Documents/APAN 5420 Anomaly Detection/Anomaly Detection R/Stocks"   # path to the data
+files <- dir(data_path, pattern = "*.txt") # get file names
+# there are some empty files so I removed them
+
+length(files)
+# 7163 unique stocks from combination of exhanges
+# create a data frame holding the file names, read files into a new data column
+all <- data_frame(filename = files) %>% 
+  mutate(file_contents = map(filename, 
+            ~ read.table(file.path(data_path, .), sep=",", header=TRUE)))
+
+all <- unnest(all)
+
+all$filename <- toupper(str_split_fixed(all$filename, fixed("."), n = 2)[,1])
+
+names(all)[1]<- "StockID"
+
+all$Date<- as.Date(all$Date)
+
+#fwrite(all,"all.csv")
+# use fwrite instead of write.csv pr write_csv since it is much faster
+# and use fread to bring back in file as an alternative to read.csv or read_csv
+
+```
+## Explore data
+
+Now that the data is in one large file I want to look for obvious outliers.
+
+```{r}
+all<- fread("all.csv")
+
+all$Date<- as.Date(all$Date)
+```
+"all.csv" is the file containing the data. It is 14.9 million rows. 16 columns, 2.6 GB in size. 
+
+```{r}
+glimpse(all)
+
+head(all)
+
+tail(all)
+
+summary(all)
+
+
+```
+OpenInt is all 0's and is likely caused by the aggregation process used to create the data files. I will not need this.
+
+The Low variable has a min of -1. This is not a logical value for a closign price. 
+
+The Max values are very high, around 200 Billion. I will investigate these issues next.
+
+
+
+```{r eval = FALSE}
+#Remove OpenInt
+ncol(all)
+all <- all[,-8]
+
+#Find where Low is -1
+index<-which(all$Low<0)
+all[(index-5):(index+5),] 
+
+# Open,High,Low,Close,Volume values from Yahoo finance for HLG on 2017-08-10
+hlg_replace<- c(10.18,	10.98,	10.13,	10.35,	32600)
+all[index,3:7] <- hlg_replace
+
+#inspect where open and close were over $100B
+head(all[which(all$Close>1000000000),])
+tail(all[which(all$Close>1000000000),])
+
+#fwrite(all,"all.csv")
+
+```
+I found that the Open, High, Low, Close and Volume were all reported differenly on Yahoo Finance. I replaced the values for HLG with these confirmed values. Values on the days on either side matched and needed no further investigating.
+
+The high open and close were related to DRYS and were found to be accurate after confirming Yahoo Finance. 
+
+## Build Features
+
+Added Features: Returns, CumReturns, Covarriance's, Variance, Sharp Ratio, Normalized variance, z-score, high-bound, low-bound, binary out-of-bound
+
+### Log Returns and CumReturns
+
+  When comparing stocks the most common metric used is returns. When analyzing returns and market behavior it is customary to use log returns with is log(1+r). My returns feature is therefore log returns.
+
+
+```{r eval=FALSE}
+
+#declare log returns
+all<-all%>%
+  group_by(StockID)%>%
+  mutate(returns=log(1+((Close - Open)/Open)))
+
+
+```
+
+```{r}
+#EDA
+#inspect all returns
+all %>% 
+  select(returns) %>% 
+  summary()
+
+```
+Infinite values are created when Open == 0 and Close is greater than 0.  When I inspect the opservations there is no other apperent pattern. When I look at Yahoo Finance the other associated values for the stocks do not match and therefore I do not feel comfortable changing the values. I will fill them with NA's for now.
+
+```{r}
+
+#view obervations
+all$returns[which(all$returns==Inf)]
+
+#replace Inf with NA
+all$returns[which(all$returns==Inf)] <-NA
+
+#re-inspect
+all %>% 
+  select(returns) %>% 
+  summary()
+```
+The NA's are all the previous Inf vlaues. Now the range looks interesting. The max and min vlues are way out of the normal range. I will inspect some of the lower bounds.
+
+```{r eval=FALSE}
+#Look at all stocks where 
+head(all[which(all$returns < -2),])
+
+#look at the returns that is > -6
+all[which(all$returns <-6),]
+
+
+# SMBK true values for open and high
+SMBK_replace <- c(16.90,	16.90	)
+all[12295463,3:4]<- SMBK_replace
+# fix returns
+all$returns[12295463]<-  log(1+((all$Close[12295463] - all$Open[12295463])/all$Open[12295463]))
+
+#BOFIL true values from yahoo
+BOFIL_replace<-c(25.5, 25.3)
+all[1937958,3:4] <-BOFIL_replace
+# fix returns
+all$returns[1937958]<-  log(1+((all$Close[1937958] - all$Open[1937958])/all$Open[1937958]))
+
+#Replace TGEN data
+TGEN_replace<-c(4.53,	5.17	)
+all[13140186,3:4] <-TGEN_replace
+# fix returns
+all$returns[13140186]<-  log(1+((all$Close[13140186] - all$Open[13140186])/all$Open[13140186]))
+
+#Replace GCBC data
+GCBC_replace<-c(17.81,	19.00		)
+all[5631431,3:4] <-GCBC_replace
+# fix returns
+all$returns[5631431]<-  log(1+((all$Close[5631431] - all$Open[5631431])/all$Open[5631431]))
+
+#Replace PHII data
+PHII_replace<-c(18.900,	20.950)
+all[10707835,3:4] <-PHII_replace
+# fix returns
+all$returns[10707835]<-  log(1+((all$Close[10707835] - all$Open[10707835])/all$Open[10707835]))
+
+```
+Most changes seem dramatic but not necessarily outside possibility. However the ones that are < -6 look concerning. I replaced the values listed in the code with the ones I validated online through yahoo finance. The majority of these stocks that I am finding out of the ordinary are due to data errors. The two columns that are consistently off are Open and High. The values that are off seem to be random.
+
+```{r }
+
+#visualize distribution of first stock returns
+ggplot(all[1:4500,], aes(x=returns)) + geom_histogram(bins=50)
+```
+
+```{r}
+#visual theme
+mytheme <- theme_bw()+
+  theme(panel.border = element_blank(),
+        axis.line = element_line(color = 'black'),
+        plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+
+
+#visualize Open & Close
+ggplot(all[1:4500,], aes(x=as.Date(Date), y=Open))+
+  mytheme+
+  geom_line(col="blue") + 
+  geom_line(aes(y=Close, col="red"))
+```
+
+```{r}
+#visualize returns
+ggplot(all[1:4500,], aes(x=as.Date(Date), y=returns))+
+  mytheme+
+  geom_line(col="blue") 
+
+
+```
+This is what I expect to see. The returns look consistent overall with a mean at 0 and normaly distributed. The spread and distributions look good. Nothing stands out.
+
+The Opem and Close look to follow eachother without dramatic differences and appear to be normal. This would have to be looked at for more than one stock showever.
+
+
+```{r eval = FALSE, echo=FALSE}
+
+#visualize distribution of first five stocks to compare
+all %>% 
+  filter(StockID == c(unique(StockID[1:5]))) %>%
+  group_by(StockID)%>%
+  melt()%>%
+  ggplot(aes(x=returns, color=StockID)) + 
+   mytheme +
+   geom_histogram()
+
+
+```
+
+## Cumulative Returns
+
+  Cumulative returns is a way to evaluate overall returns for a specific investment. This can be used to evaluate a break even point, cash-out point, or other specific goals. 
+```{r eval=FALSE}
+
+#declare Cumulative returns
+all<- all%>%
+  group_by(StockID)%>%
+  mutate(CumRet=cumsum(returns))
+```
+
+The Infinite values here were not fixed due to time. But will be fixed for part 2.
+
+```{r }
+
+#EDA
+#inspect all returns
+all %>% 
+  select(CumRet) %>% 
+  summary()
+```
+
+
+
+```{r}
+
+#visualize distribution of first stock returns
+ggplot(all[1:4500,], aes(x=as.Date(Date), y=CumRet))+
+  mytheme +
+  geom_line(col="blue") 
+```
+
+
+
+```{r eval=FALSE, echo=FALSE}
+
+#visualize distribution of first five stocks to compare
+all %>% 
+  filter(unique(StockID)[1:5] %in% StockID  ) %>%
+  group_by(StockID)%>%
+  melt()%>%
+  ggplot( aes(x=as.Date(Date), y=CumRet, color=StockID)) + 
+    mytheme + 
+    geom_line()
+
+```
+
+
+## Rolling Mean
+
+  Another way to evaluate the value of a stock is its future value. This can be measured in many ways but the most common is its Expected returns. There are many ways to calculate this value. Some common way's are a simple average, moving average, or weighted average. The wieghts can be set for various reasons one of which is to create a recency bias. I will use a simple rolling average.
+```{r eval=FALSE}
+
+#rolling Mean (Simple Expected Returns last 30)
+all<- all%>%
+  group_by(StockID)%>%
+  mutate(rMean = rollmean(returns, k = 30, na.pad = TRUE))
+```
+
+```{r}
+#EDA
+#inspect all returns
+all %>% 
+  select(rMean) %>% 
+  summary()
+```
+
+
+
+```{r}
+
+#visualize distribution of first stock
+ggplot(all[31:4500,], aes(x=as.Date(Date), y=rMean))+
+  mytheme +
+  geom_line(col="blue") 
+```
+
+### Rolling Varriance
+
+  Risk is the other aspect of stocks that is used to evaluate performance. Variance, covariance, and standard deviation are different measurements of risk. I will caculate a rolling variance and cumulative variance to try to capture a short term and long term risk feature. 
+```{r eval=FALSE}
+#rolling monthly, 30 day, Variance
+all<- all%>%
+  group_by(StockID)%>%
+  mutate(rVar = rollapply(returns, width = 30, FUN = var, na.pad = TRUE))
+```
+
+```{r}
+
+# Start EDA
+all %>% 
+  select(rVar) %>% 
+  summary()
+```
+
+
+
+```{r}
+
+#visualize distribution of first stock 
+ggplot(all[31:4500,], aes(x=as.Date(Date), y=rVar))+
+  mytheme +
+  geom_line(col="blue") 
+```
+
+
+### Sharp Ratio 
+
+  A performance measurement that describes the relationship between risk and return is the sharp ratio. This is used to measure returns over risk. The higher the value the better the score. The equation is (Returns - (risk free rate)) / sqrt(variance).
+```{r eval= FALSE}
+
+#Sharp Ratio
+all<- all%>%
+  group_by(StockID)%>%
+  mutate(SR = returns/sqrt(rVar))
+
+```
+
+```{r}
+
+# Start EDA
+all %>% 
+  select(SR) %>% 
+  summary()
+```
+
+
+
+```{r}
+
+#visualize distribution of first stock 
+ggplot(all[31:4500,], aes(x=as.Date(Date), y=SR))+
+  mytheme +
+  geom_line(col="blue") 
+```
+
+### Normalized Variance
+
+  One measurement relative to risk that might be interesting is to find out how risky the short term period is relative to the long-term. Therefore normalizing the the risk will allow you to determine if the short term risk is beyond a certain distance, or evaluate the likelyhood of a the short term risk. 
+```{r eval=FALSE}
+
+#Replace NA's with 0's for now
+na_index<-is.na(all$rVar)
+all$rVar[na_index]<-0
+
+#calculate mean, sd and normalized values for the rolling variance
+all<- all%>%
+  group_by(StockID)%>%
+  mutate(meanVar = rollmean(rVar, k = 30, na.pad = TRUE), sdVar = rollapply(rVar, width = 30, FUN = sd, na.pad = TRUE), NormVar = (rVar - meanVar)/sdVar)
+
+#Fill back in the NA's
+all$rVar[na_index]<-NA
+all$sdVar[na_index]<-NA
+all$NormVar[na_index]<-NA
+
+
+```
+
+```{r}
+
+# Start EDA
+all %>% 
+  select(NormVar) %>% 
+  summary()
+```
+
+
+
+```{r}
+
+#visualize distribution of first stock 
+ggplot(all[31:4500,], aes(x=as.Date(Date), y=NormVar))+
+  mytheme +
+  geom_line(col="blue") +
+  geom_hline(yintercept = c(-2,2), col="red", lty=2)
+```
+The visual here makes it pretty easy to see that there are multiple events that aregoing beyond the normal boundaries. These events should be investigated further to identify if there are further issues with the data or if these are events of interest. A binary signal would be nice to be able to quickly identify the crossing of these boundary lines.
+
+### Binary out-of-bounds > +- 1.96 SD's 
+
+This indicator is just an easy way to identify those values that are beyond the 95% quantile for risk. This is a transformation of NormVar. 
+
+
+```{r eval=FALSE}
+#Create Binary variabel to determine if Variance is more than 1.96 sd's away
+
+all<- all%>%
+  group_by(StockID)%>%
+  mutate(OOB =  as.numeric(NormVar>=1.96|NormVar<= (-1.96)))
+
+#fwrite(all, "all.csv")
+
+##saving RData files instead of csv
+#save(all, file="all.rda")
+#load("all.rda")
+
+```
+
+I want to know how many times the risk or variance of stocks goes outside of the expected bounds. I expect no more than 5% since that is the limit I set NormVar. 
+```{r}
+#proportion of occurances out of bounds
+mean(all$OOB,na.rm = T)
+#less than 1%
+```
+I find it curious that less than 1% of all varianc measurments occure outside the boundaries. This could be due to the fact that we are using a rolling variance and not a more academic approach to calculating variance.
+
+One last look at the data.
+```{r}
+
+glimpse(all)
+
+head(all[-30,],10)
+
+tail(all,10)
+
+```
+
+```{r}
+names(all)
+
+```
+All the features relate to returns and the relationship between Open and Close. These features are therefore highly coorolated and migh not be very usefull together. Some additional features that would have been usefull would have been relationships with returns and volume. However due to time I did not create these features.
