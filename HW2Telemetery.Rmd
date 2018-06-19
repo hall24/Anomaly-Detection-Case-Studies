@@ -1,0 +1,870 @@
+---
+title: "HW2Telemetery"
+author: "Elijah Hall"
+date: "May 31, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Telemetery
+
+```{r message=FALSE}
+library(rmarkdown)
+library(tidyverse)
+library(lubridate)
+library(data.table)
+
+library(TTR)
+library(zoo)
+library(cumstats)
+library(corrplot)
+
+#visual theme
+mytheme <- theme_bw()+
+  theme(panel.border = element_blank(),
+        axis.line = element_line(color = 'black'),
+        plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+## Case 2: Telemetry Data
+
+  The data if from a Java application (Weblogic based application) and was collected from JMX with multiple hosts and multiple processes. The raw data consists of 27,875 Files, 22.9 GB, 2 Years of data from 2014 to 2015. The system output pre-processed aggregate features and evaluation metrics that consist of 200 files, 9.3 GB. The data to be analyzed is this smaller data set of aggregated reporting features. A key note is that "-1" values will indicate missing values.
+  
+  The first step is to read in a small set to evaluate the data. Since the files all have the same variables, one of which is time, I will evaluate the first 10 to do preliminary EDA before creating features. My goal is to evaluate the distributions and relevance of these features. 
+
+### Reading in and merging the data
+
+  I will read in the first 10 files and merge them into one file and saving it. This reduced data set is make sure I have addiquite memory and computational power on my personal computer to do what the analysis. In reality I would want a larger ample of the data set. Since this is only 5% of the data and is at the begining it is likely not a good representation of the whole dataset. I will want to sample from a random spot in the future to test my features.
+
+```{r helperfuntions, echo=FALSE}
+#These functions were provided by our instructor to save us some time in the EDA stage
+
+#' Will load the list of filenames into one data.frame
+#' 
+#' @param fileList a list of filenames to load
+#' @param newNames if not null, will replace loaded names with these names (assumed to align in order)
+#' 
+#'
+loadTelemetryFiles <- function( fileList, newNames = NULL ) {
+  df <- data.frame()
+  
+  # all files into one
+  for (f in fileList) {
+    print(sprintf("Loading: %s ...", f))
+    
+    aDF <- read.csv(file = f, stringsAsFactors = FALSE)
+    
+    if (is.null(aDF) || nrow(aDF) == 0) {
+      print("...skipping, empty")
+      next
+    }
+    
+    if ( is.null(newNames) == FALSE && length(newNames) == length(names(aDF)) ) {
+      names(aDF) <- newNames  
+    }
+
+    df <- rbind(df, aDF)
+    
+    print("Done")
+  }
+  
+  df
+}
+
+#' Convenience function to plot the name length distribution of a data.frame
+#' 
+#'  @param dataFrame the dataframe 
+#'  @param numBins the number of bins for the distribution
+#'  
+plotCharLengthDistribution <- function( colNames, nBins = 10 ) {
+  # lets have a look at the names
+  nameLengths = data.frame( name = colNames )
+  nameLengths$charCount = nchar( colNames )
+  
+  nameLengths %>% arrange( desc(charCount) )
+  
+  plotDistribution(nameLengths, "charCount", nBins = nBins)
+}
+
+#' removes bad characters from the list of strings
+#' 
+#' @param orgNames array of strings who's names are to be adjusted
+#' 
+cleanNames <- function( orgNames ) {
+  newNames <- gsub(" ", "_", orgNames)
+  newNames <- gsub(":", "_", newNames)
+  newNames <- gsub("/", "_div_", newNames)
+  newNames <- gsub("-", "_", newNames)
+  newNames <- gsub("\\.", "_", newNames)
+  newNames <- gsub("___", "_", newNames)
+  newNames <- gsub("__", "_", newNames)
+  
+  newNames
+}
+
+#' Convenience function to plot a distribution
+#' 
+#' @param aDF data.frame data to use for the plot
+#' @param colName name of the columns who's distribution you want plotted
+#' @param nBins number of bins to plot
+#' 
+plotDistribution <- function(aDF, colName, nBins = 100) {
+  
+  # Lets plot the distributions
+  p <- ggplot(data = aDF) +
+    aes_string(x = sprintf("%s", colName) ) + 
+    geom_histogram( bins = nBins, fill = "blue", alpha = .75 ) +
+    labs(title = colName, x = colName, y = "Count")
+  p
+  
+}
+
+```
+
+```{r }
+data_path <- "C:/Users/usmc_/Documents/APAN 5420 Anomaly Detection/Anomaly Detection R/FEATURES-2014-2015"   # path to the data
+files <- dir(data_path, pattern = "*.csv") # get file names
+# there are some empty files so I removed them
+
+length(files)
+# 7163 unique stocks from combination of exhanges
+# create a data frame holding the file names, read files into a new data column 
+
+
+```
+
+#### Evaluating fastest option to read in files
+
+  With such large files it is hard to tell which is the best way to read them in. I want to test three different ways. The first is read_csv() which has been a fast a usefull function in the past but I have noticed with large files it can still be slow. The second is fread() which has been faster in the past at reading than read_csv. The third and final is the read function created and provided to teh class. I will read in the first file, size = 60MB
+```{r eval=FALSE}
+speed<- data.frame(method = c("read_csv","fread","loadTelemetryFiles"), time_seconds = c(0,0,0) )
+
+start<-proc.time()
+test <- read_csv(paste0(data_path,"/",files[1]))
+speed$time_seconds[1] <-(proc.time()-start)[3]
+
+start<-proc.time()
+test <- fread(paste0(data_path,"/",files[1]))
+speed$time_seconds[2] <- (proc.time()-start)[3]
+
+start<-proc.time()
+test <- loadTelemetryFiles(paste0(data_path,"/",files[1]))
+speed$time_seconds[3] <- (proc.time()-start)[3]
+
+```
+
+```{r eval=FALSE, echo=FALSE}
+fwrite(speed, "speed.csv")
+
+```
+
+```{r echo=FALSE}
+speed <- fread("speed.csv")
+```
+
+```{r}
+#which method is the fastest
+paste0("The winner is ", speed[which(speed[,2] == min(speed[,2])),1], "()")
+```
+
+```{r}
+speed
+```
+
+   We can see the the obvious winner is fread. Surprisingly read_csv is much slower than I anticipated. Even teh function provided to the class is slower by about a factor of 10. 
+
+#### Read in the sample files
+
+  Using the best method I will read inthe first 5 files. There is an alternative way to read the files in and retain the file information. This is helpful when debugging. I will use option 2 during my EDA. 
+
+```{r read_option_1, eval= FALSE}
+
+#option 1
+all <- map(filename, ~ fread(file.path(data_path, .)))
+
+```
+
+```{r read_option_2}
+#option 2 to keep file info to help with debugging
+start<-proc.time()
+all <- data_frame(filename = files[1:5]) %>% 
+  mutate(file_contents = map(filename, 
+            ~ fread(file.path(data_path, .))))
+
+all <- unnest(all)
+
+#remove file extension
+all$filename <- str_split_fixed(all$filename, fixed("."), n = 2)[,1]
+
+total_read_time<-(proc.time()-start)[3]
+# takes about 4.5 seconds
+total_read_time
+
+```
+
+```{r echo= FALSE}
+print("elapsed 4.41")
+```
+
+```{r eval= FALSE,echo=FALSE}
+fwrite(all, "all_tel_1.csv")
+```
+
+```{r  eval= FALSE, echo=FALSE}
+all<- fread("all_tel_1.csv")
+```
+
+```{r}
+head(names(all),10)
+```
+  The variable names are very long. This is very common with telemetric data. The names tend to carry usefull infomration and therefore we want to keep what is usefull. However we can reduce the name lengths dramatically makeing them more usefull. First, I want to look at the distribution of names. Then I want to clean them of un helpfull charachters.
+```{r}
+#use the helper function provided
+plotCharLengthDistribution(names(all))
+```
+  The distribution of variable lengths is mostly > 100. Thankfully we are provided a file with shortened names. However these names might lose certain information and therefore we need to have all available information for later when we create new features. 
+```{r}
+#this df contains the information for the variable names and is helpful for understanding variable characteristics
+Vnames_df<- fread("features-schema-descriptions.csv")
+
+plotCharLengthDistribution(Vnames_df$short_name)
+```
+
+```{r}
+#add 1 to the column since I added the filename
+Vnames_df$column <- Vnames_df$column + 1
+
+#a quick look at the column names of this df
+names(Vnames_df)
+```
+
+```{r }
+#assign shortened names to all
+names(all)[-1] <- Vnames_df$short_name
+
+#clean names of unwanted charachters
+names(all)<- cleanNames(names(all))
+
+```
+
+```{r eval= FALSE,echo=FALSE}
+fwrite(all, "all_clean.csv")
+```
+
+```{r eval= FALSE, echo=FALSE}
+all <- fread("all_clean.csv")
+```
+
+```{r }
+
+#there is a problem with the names and graphing isn't likeing the format so..
+#save the actual colnames
+short_names<- names(all)
+
+#assign numeric values to the metric columns for graphing
+names(all)[6:ncol(all)]<- 6:ncol(all)
+
+```
+
+```{r}
+#look at some variable distributions to identify patters in different variables
+for (i in 6:26) {
+  print(qplot(x=all[,i], main = short_names[i]))
+}
+
+```
+#### Removing Constant Variables
+  
+  There are many variables that appear to be constants. These can be helpfull in the long run to identify anomalies however they wont be helpful to create new features. Therefore, I will need to identify them and remove them. The column names to be removed must be saved and chacked later when I look at a larger sample of all the data to determine if they truely are constants.
+```{r}
+
+#how many logical variables are there taht wont have normal summary stats
+var_logicals<-vector("logical", ncol(all))
+for (i in 1:ncol(all)){
+  var_logicals[i]<- is.logical(all[,i])
+}
+sum(var_logicals)
+```
+```{r}
+names(all)[var_logicals]
+```
+  There is only 1 logical variable and that is "is.Anomaly". 
+```{r}
+unique(all[,5])
+```
+  "is.Anomaly" is FALSE for all observations, it is constant, and can be removed with all other identified constant variables.
+```{r }
+#remove constant variables
+sum_var<- as.data.frame(matrix(NA, nrow=ncol(all), ncol = 6))
+names(sum_var)<- c("Min.", "1st Qu.","Median", "Mean","3rd Qu.", "Max.") 
+
+for (i in 6:ncol(all)){
+    sum_var[i,] <- as.numeric(str_split_fixed(summary(all[,i]), pattern = fixed(":"), 2)[,2])
+}
+
+#create index for constants 
+constants_index<- which(sum_var$Min. == sum_var$Max.)
+
+#add "is.Anomaly"
+constants_index<- c(5,constants_index)
+
+#before subset add back column names
+names(all)<- short_names
+
+#subset for variable that are not constant
+all_reduced<- all[,-constants_index]
+
+Vnames_df_reduced<- Vnames_df[-(constants_index-1),]
+```
+
+```{r eval=FALSE, echo=FALSE}
+fwrite(all_reduced, "all_reduced.csv")
+```
+
+```{r eval=FALSE, echo=FALSE}
+all_reduced<- fread("all_reduced.csv")
+```
+
+  Now lets look a some distributions again
+```{r}
+for ( i in 5:20) {
+  print( qplot(x=all_reduced[,i], main = Vnames_df_reduced$short_name[i]))
+}
+
+```
+Many variables are still mostly one value. Lets look at a few variables and the unique values. If there is a binary variable then the Min. = 0 and Max. = 1. These binary variables will be usefull in identifying anomalies later, however my goal is to create features by combining certain ones and reducing overall variable counts while making more meaningful features. Therefore I will remove these binary variables for now.This will make it easier to visually process the amount of data make scanning variabels easier.
+
+```{r }
+#find binary variables
+sum_var_reduced <- sum_var[-constants_index,]
+
+binary_index <- which(sum_var_reduced$Min.== 0 & sum_var_reduced$Max.==1)
+
+all_reduced<- all_reduced[,-binary_index]
+
+Vnames_df_reduced <- Vnames_df_reduced[-binary_index,]
+
+ncol(all_reduced)
+
+```
+
+```{r eval=FALSE, echo=FALSE}
+fwrite(all_reduced, "all_reduced_2.csv")
+```
+
+```{r eval=FALSE, echo=FALSE}
+all_reduced <- fread("all_reduced_2.csv")
+
+```
+
+```{r}
+par(mfrow =c(4,4))
+for ( i in 5:20) {
+  print( qplot(x=all_reduced[,i], main = Vnames_df_reduced$short_name[i]))
+}
+
+```
+
+
+### Aggregating Route 1  
+  
+  Better! Now we have a reduced data frame with about 100 metrics or variables. If we look at the "timestamp" variable we see the DTG as "%Y-%m-%d %H:%M". I want to aggregate these opbservations to 5 minute intervals.
+```{r }
+# create the time aggregation column
+# ------------------------------------
+
+# create new column for the 5 minute bucket....
+tBucket <- 5
+
+# create hours/minute features
+
+# first translate the timestamp character column
+all_reduced$timestamp <- ymd_hm(all_reduced$timestamp)
+
+# now extract features for date, hour and minute
+all_reduced$Date <- as.Date(all_reduced$timestamp)
+all_reduced$Hour <- hour(all_reduced$timestamp)
+all_reduced$Minute <- minute( all_reduced$timestamp)
+
+# create a rounded minute bucket
+all_reduced$Minute5 <- (all_reduced$Minute %/% tBucket ) * tBucket
+
+# combine into one feature (this is what we will aggregate on)
+all_reduced$aggTime <- sprintf("%s %02d:%02d", all_reduced$Date, all_reduced$Hour, all_reduced$Minute5)
+
+```
+```{r}
+#lets look at the output
+all_reduced %>% select(aggTime, timestamp) %>% arrange( aggTime ) %>% head(10)
+```
+ 
+```{r eval=FALSE, echo=FALSE}
+fwrite(all_reduced, "all_reduced-aggtime.csv")
+
+```
+
+```{r eval=FALSE, echo=FALSE}
+all_reduced<- fread("all_reduced-aggtime.csv")
+
+```
+
+  The next section will merge all source variables and then aggregate by time. There are 8 sources: 1,2,3,4,5,6,9,and 10. There are also 10 different variable names accross those sources.
+```{r }
+#aggregate by source
+
+source_index<- which(str_detect(names(all_reduced), "source"))
+
+all_sources<- names(all_reduced)[source_index]
+
+agg_Connection_delay <- all_sources[which(str_detect(all_sources, "Connection_delay"))]
+
+agg_Available_db <- all_sources[which(str_detect(all_sources, "Available_db"))]
+
+Prepared_statement <- which(str_detect(all_sources, "Prepared_statement"))
+
+DB_connection_started <-which(str_detect(all_sources, "DB_connection_started"))
+
+Rel_unavailable <- which(str_detect(all_sources, "Rel_unavailable"))
+
+Reserve_request <- which(str_detect(all_sources, "Reserve_request"))
+
+Active_connections <- which(str_detect(all_sources, "Active_connections"))
+
+Failing_reserve <- which(str_detect(all_sources, "Failing_reserve"))
+
+#there are still different variables names for certain events
+all_sources
+
+agg1Cols <- agg_Connection_delay[which(str_detect(agg_Connection_delay, "JDBCConnectionPoolRuntime"))]
+agg2Cols <- agg_Connection_delay[which(str_detect(agg_Connection_delay, "JDBCDataSourceRuntime"))]
+agg3Cols <- agg_Available_db[which(str_detect(agg_Available_db, "JDBCConnectionPoolRuntime"))]
+agg4Cols <- agg_Available_db[which(str_detect(agg_Available_db, "JDBCDataSourceRuntime"))]
+agg5Cols <- all_sources[Prepared_statement]
+agg6Cols<- all_sources[DB_connection_started]
+agg7Cols<- all_sources[Rel_unavailable]
+agg8Cols<- all_sources[Reserve_request]
+agg9Cols<- all_sources[Active_connections]
+agg10Cols<- all_sources[Failing_reserve]
+
+all_reduced2 <- all_reduced %>%
+  ungroup()%>%
+  mutate( 
+    Connection_delay_JDBCConnectionPoolRuntime_sum = select(., agg1Cols) %>% rowSums(),
+    Connection_delay_JDBCDataSourceRuntime_sum = select(., agg2Cols) %>% rowSums(),
+    Available_db_connection_activity_JDBCConnectionPoolRuntime_sum = select(., agg3Cols) %>% rowSums(),
+    Available_db_connection_activity_JDBCDataSourceRuntime_sum = select(., agg4Cols) %>% rowSums(),
+    Prepared_statement_sum = select(., agg5Cols) %>% rowSums(),
+    DB_connection_started_sum = select(., agg6Cols) %>% rowSums(),
+    Rel_unavailable_sum = select(., agg7Cols) %>% rowSums(),
+    Reserve_request_sum = select(., agg8Cols) %>% rowSums(),
+    Active_connections_sum = select(., agg9Cols) %>% rowSums(),
+    Failing_reserve_sum = select(., agg10Cols) %>% rowSums()
+    )
+
+
+all_reduced3<- all_reduced2[,-source_index]
+
+groupCols <- c("filename", "host", "process", "aggTime")
+
+# columns to aggregate on
+aggCols <- names(all_reduced3)
+aggCols <- aggCols[! aggCols %in% c(groupCols, "timestamp", "Date", "Hour", "Minute", "Minute5")]
+
+
+all_reduced4 <- all_reduced3 %>% 
+  group_by_at( groupCols ) %>%
+  summarize_at( aggCols, c("min", "mean", "max"), na.rm = TRUE )
+
+#make index to reference later
+min_index<- which(str_detect(names(all_reduced4),"_min"))
+mean_index <- which(str_detect(names(all_reduced4),"_mean"))
+max_index <- which(str_detect(names(all_reduced4),"_max"))
+
+```
+
+```{r eval=FALSE, echo=FALSE}
+fwrite(all_reduced4, "all_reduced_4.csv")
+```
+
+```{r eval=FALSE, echo=FALSE}
+all_reduced4 <- fread("all_reduced_4.csv")
+```
+### Aggregating Route 2 The 'tidy' Way
+
+  I spent so much time trying to merge all the sources and aggregating time variables. I felt there must be abetter way to make this data more organized and "tidy". I decided to go my own route using tidyverse packages with the intent to be able to use ggplot packages to plot nice visuals.
+
+```{r}
+#create function to split variable names to seperate variables
+split_names <- function(x){
+ test_str_plit <- str_split_fixed(x, pattern = "source", 2)
+ test_str_plit_2 <- str_split_fixed(test_str_plit[,2], pattern = "_", 2)
+
+ source= test_str_plit_2[1]
+ JDBC= str_remove(test_str_plit_2[2], "JDBC")
+ type= test_str_plit[1]
+ return(c(source, JDBC, type))
+  
+}
+
+#Make into tidy data
+all_reduced_source <- all_reduced[,c(1:4,source_index)]
+
+ #create tidy data.frame
+ new_tidy_df<-data.frame(all_reduced_source[,1:4], 
+                         source = rep(split_names(names(all_reduced_source)[5])[1], nrow(all_reduced_source)),
+                         JDBC = rep(split_names(names(all_reduced_source)[5])[2], nrow(all_reduced_source)),
+                         type = rep(split_names(names(all_reduced_source)[5])[3], nrow(all_reduced_source)),
+                         value=   all_reduced_source[,5])
+names(new_tidy_df)<- c("filename","host","process",  "timestamp","source" ,"JDBC","type", "value")
+ 
+for(i in 6:ncol(all_reduced_source)){
+   tem_df <- data.frame(all_reduced_source[,1:4], 
+                           source = rep(split_names(names(all_reduced_source)[i])[1], nrow(all_reduced_source)),
+                           JDBC = rep(split_names(names(all_reduced_source)[i])[2], nrow(all_reduced_source)),
+                           type = rep(split_names(names(all_reduced_source)[i])[3], nrow(all_reduced_source)),
+                           value=   all_reduced_source[,i])
+   names(tem_df)<- names(new_tidy_df)
+   new_tidy_df<- rbind(new_tidy_df, tem_df)
+ }
+#takes about 4 - 5 minutes
+```
+  
+```{r eval=FALSE, echo=FALSE}
+ fwrite(new_tidy_df, "new_tidy_df.csv")
+ 
+ new_tidy_df<- fread("new_tidy_df.csv")
+ 
+```
+
+```{r}
+
+#----------------
+# create new column for the 5 minute bucket....
+tBucket <- 5
+
+# create hours/minute features
+# now extract features for date, hour and minute
+new_tidy_df$Date <- as.Date(new_tidy_df$timestamp)
+new_tidy_df$Hour <- hour(new_tidy_df$timestamp)
+new_tidy_df$Minute <- minute( new_tidy_df$timestamp)
+
+# create a rounded minute bucket
+new_tidy_df$Minute5 <- (new_tidy_df$Minute %/% tBucket ) * tBucket
+
+# combine into one feature (this is what we will aggregate on)
+new_tidy_df$aggTime <- sprintf("%s %02d:%02d", new_tidy_df$Date, new_tidy_df$Hour, new_tidy_df$Minute5)
+ 
+
+groupCols <- c("filename", "host", "process", "source", "JDBC","type","aggTime")
+
+#aggregate by 5 minute intervals
+new_tidy_df2 <- new_tidy_df %>% 
+  group_by_at( groupCols ) %>%
+  summarize( value= (mean(value, na.rm = TRUE )))
+
+#change group by columns to remove source
+groupCols2 <- c("filename", "host", "process","JDBC","type","aggTime")
+
+#aggregate by source
+new_tidy_df2 <- new_tidy_df %>% 
+  group_by_at( groupCols2 ) %>%
+  summarize( value= (mean(value, na.rm = TRUE )))
+
+
+```
+
+ 
+```{r eval=FALSE, echo=FALSE}
+ fwrite(new_tidy_df, "new_tidy_df2.csv")
+ 
+ new_tidy_df<- fread("new_tidy_df2.csv")
+ 
+```
+
+
+### Start Feature enginering
+
+  
+
+
+```{r}
+new_tidy_df3<- new_tidy_df2[4:7]
+
+DataSource_df <- new_tidy_df3[which(str_detect(new_tidy_df3$JDBC,"DataSource")),2:4]
+#duplicates were created in the data due to the multiple file sources
+DataSource_df<-DataSource_df[!duplicated(DataSource_df),]
+DataSource_df<-DataSource_df[!duplicated(DataSource_df[,1:2]),]
+
+ConnectionPool_df <- new_tidy_df3[which(str_detect(new_tidy_df3$JDBC,"ConnectionPool")),2:4]
+#duplicates were created in the data due to the multiple file sources
+ConnectionPool_df<-ConnectionPool_df[!duplicated(ConnectionPool_df), ]
+ConnectionPool_df<-ConnectionPool_df[!duplicated(ConnectionPool_df[,1:2]), ]
+
+DataSource_df<- DataSource_df%>%
+  spread(key=type,value=value)
+
+ConnectionPool_df<- ConnectionPool_df%>%
+  spread(key=type,value=value)
+
+
+```
+ Now that we have our cleaned tables with this subset of data lets look at it and create some valuable features.
+```{r}
+names(DataSource_df)
+
+range(DataSource_df$Prepared_statement_cache_hit_rate_)
+```
+```{r}
+summary(DataSource_df$Prepared_statement_cache_hit_rate_)
+```
+```{r}
+length(which(DataSource_df$Prepared_statement_cache_hit_rate_>3))/nrow(DataSource_df)
+#2122 cases of 39855 or about 5%
+```
+```{r}
+hist(x=DataSource_df$Prepared_statement_cache_hit_rate_)
+
+```
+#### Feature #1 Zscore of "Prepared_statement_cache_hit_rate_" and binary outofbounds
+  The range and distribution is very wide for this variable. Knowing the points where values are extreme are important. The sensativity of this measurement should be based on the importance of not noticing such extreme values. In any case I am going to make an arbitraty cut off for at the 0.05 significance level making sure that any values that have less than a 5%  of being observed will be marked.
+  
+```{r}
+
+DataSource_df$Prepared_statement_cache_hit_rate_Zscore <- scale(DataSource_df$Prepared_statement_cache_hit_rate_)
+
+DataSource_df <-  DataSource_df%>%
+  mutate(Prepared_statement_cache_hit_rate_OOB =  
+           as.numeric(Prepared_statement_cache_hit_rate_Zscore >= 1.96 | 
+                        Prepared_statement_cache_hit_rate_Zscore <= (-1.96)))
+
+hist(x=DataSource_df$Prepared_statement_cache_hit_rate_Zscore)
+#this should look the same as it is just a scaling transformation
+```
+```{r}
+#a better look at with log transformation of the variable
+ggplot(DataSource_df, aes(x=ymd_hm(aggTime), y=log(abs(Prepared_statement_cache_hit_rate_))))+
+  mytheme +
+  geom_line()+
+  geom_hline(yintercept = log(1.96), col="red", lty=2)
+
+```
+  This transformation makes it very easy to see the points and pattern at wich these values are observed.
+  
+#### Feature #2 "Available_db_connection_activity_" Zscore and out of bounds metric
+
+  This variable is important to be aware of as it relates to availability of connections to the database. Knowing where the values are extreme could be indicators of a problem.
+
+```{r}
+range(DataSource_df$Available_db_connection_activity_)
+
+summary(DataSource_df$Available_db_connection_activity_)
+
+hist(x=DataSource_df$Available_db_connection_activity_)
+
+ggplot(DataSource_df, aes(x=ymd_hm(aggTime), y=Available_db_connection_activity_))+
+  mytheme +
+  geom_line()
+
+
+```
+  This looks wierd. Maybe this variable should be treated as a discrete variable, but the range of discreate values are not evenly spaced in a way taht is easily recognizable. Therefore I will leave it as a numeric variable.
+
+```{r}
+unique(DataSource_df$Available_db_connection_activity_)
+
+table(DataSource_df$Available_db_connection_activity_)
+
+```
+```{r}
+DataSource_df$Available_db_connection_activity_Zscore <- scale(DataSource_df$Available_db_connection_activity_)
+
+DataSource_df <-  DataSource_df%>%
+  mutate(Available_db_connection_activity_OOB =  
+           as.numeric(Available_db_connection_activity_Zscore >= 1.96 | 
+                        Available_db_connection_activity_Zscore <= (-1.96)))
+```
+  Lets look at "Active_connections_" necxt to see if it sheds some light on the previous variable.
+```{r}
+range(DataSource_df$Active_connections_)
+
+summary(DataSource_df$Active_connections_)
+
+hist(x=DataSource_df$Active_connections_)
+
+
+```
+This variable realy is deicrete since it identifies available connections which msut be integer values.
+```{r}
+ggplot(DataSource_df, aes(x=ymd_hm(aggTime), y=Active_connections_))+
+  mytheme +
+  geom_line()
+
+```
+```{r}
+length(which(DataSource_df$Active_connections_ >2 |DataSource_df$Active_connections_ <2))/nrow(DataSource_df)
+
+```
+
+This shows obvious marks of potential outliers. Since less than about 8% of observation > or < 2 I wonder if there is a corrolation between the these two variables: "Available_db_connection_activity_" and "Active_connections_".
+
+```{r}
+#create Zscore and OOB metrics for Active_connections_ 
+DataSource_df$Active_connections_Zscore <- scale(DataSource_df$Active_connections_)
+
+DataSource_df <-  DataSource_df%>%
+  mutate(Active_connections_OOB =  
+           as.numeric(Active_connections_Zscore >= 1.96 | 
+                        Active_connections_Zscore <= (-1.96)))
+
+#check corrolation
+cor(DataSource_df$Active_connections_Zscore, DataSource_df$Available_db_connection_activity_Zscore)
+```
+There is almost no coorolation. Lets check the corrolations between all variables.
+```{r}
+
+cor(DataSource_df[2:12])
+```
+
+```{r}
+
+# code and visualization found at http://www.sthda.com
+cor.mtest <- function(mat, ...) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat<- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], ...)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+        }
+    }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+# matrix of the p-value of the correlation
+p.mat <- cor.mtest(cor(DataSource_df[2:12]))
+
+corrplot(cor(DataSource_df[,2:12]), type="upper", order="hclust", 
+         p.mat = p.mat, sig.level = 0.01)
+
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+
+corrplot(cor(DataSource_df[,2:12]), method="color", col=col(200),  
+         type="upper", order="hclust", 
+         addCoef.col = "black", # Add coefficient of correlation
+         tl.col="black", tl.srt=45, #Text label color and rotation
+         # Combine with significance
+         p.mat = p.mat, sig.level = 0.01, insig = "blank", 
+         # hide correlation coefficient on the principal diagonal
+         diag=FALSE 
+         )
+
+
+```
+There is a corrolation of .5 between "DB_connection_started_",  "Available_db_connection_activity_". A strategy to reduce features is to combine those that are highly corrolated. Therefore, for the last feature I will look at the two and try to combine them.
+
+```{r}
+range(DataSource_df$DB_connection_started_)
+summary(DataSource_df$DB_connection_started_)
+hist(DataSource_df$DB_connection_started_)
+
+```
+```{r}
+range(DataSource_df$Available_db_connection_activity_)
+summary(DataSource_df$Available_db_connection_activity_)
+hist(DataSource_df$Available_db_connection_activity_)
+
+```
+```{r}
+ggplot(DataSource_df[1500:1700,], aes(x=ymd_hm(aggTime), y=Available_db_connection_activity_))+
+  mytheme +
+  geom_line()+
+  geom_line(aes(y=DB_connection_started_, col="red"))
+
+DataSource_df<- DataSource_df%>%
+  mutate( connection_Drive_nactivity = Available_db_connection_activity_/DB_connection_started_)
+
+#replace NA and Inf with 0
+na_inf_index<- c(which(is.na(DataSource_df$connection_Drive_nactivity)), which(!is.finite(DataSource_df$connection_Drive_nactivity)))
+
+DataSource_df$connection_Drive_nactivity[na_inf_index] <- 0
+
+ggplot(DataSource_df, aes(x=ymd_hm(aggTime), y=connection_Drive_nactivity))+
+  mytheme +
+  geom_line()
+
+DataSource_df$connection_Drive_nactivity_Zscore <- scale(DataSource_df$connection_Drive_nactivity)
+
+DataSource_df <-  DataSource_df%>%
+  mutate(connection_Drive_nactivity_OOB =  
+           as.numeric(connection_Drive_nactivity_Zscore >= 1.96 | 
+                        connection_Drive_nactivity_Zscore <= (-1.96)))
+
+#zoom in on the vizual to be able to see since the variablemoves so much it is hard to see with all the data on one graph.
+ggplot(DataSource_df[1:1000,], aes(x=ymd_hm(aggTime), 
+                          y = log(abs(connection_Drive_nactivity_Zscore)))) +
+  mytheme +
+  geom_line()+
+  geom_hline(yintercept = log(1.96), col="red", lty=2)
+
+
+```
+  This feature is appears to go beyond the .05 threshold alot. When you sum the OOB values you see that 3677 observations out of the total 39852 fall out of bounds. That is about 9% which confirm that the extreme values migh not be so extreme. I will set the significance level higher to ensure that the values we are marking are infact extreme.
+  
+  
+### Create Features to identify based
+```{r}
+
+DataSource_df <-  DataSource_df%>%
+  mutate(connection_Drive_nactivity_OOB =  
+           as.numeric(connection_Drive_nactivity_Zscore >= 2.58 | 
+                        connection_Drive_nactivity_Zscore <= (-2.58)))
+
+ggplot(DataSource_df[1:1000,], aes(x=ymd_hm(aggTime), 
+                          y = log(abs(connection_Drive_nactivity_Zscore)))) +
+  mytheme +
+  geom_line()+
+  geom_hline(yintercept = log(3.1), col="red", lty=2)
+
+```
+Now that looks more reasonable.
+
+```{r}
+p.mat <- cor.mtest(cor(DataSource_df[2:15]))
+corrplot(cor(DataSource_df[,2:15]), method="color", col=col(200),  
+         type="upper", order="hclust", 
+         addCoef.col = "black", # Add coefficient of correlation
+         tl.col="black", tl.srt=45, #Text label color and rotation
+         # Combine with significance
+         p.mat = p.mat, sig.level = 0.01, insig = "blank", 
+         # hide correlation coefficient on the principal diagonal
+         diag=FALSE 
+         )
+```
+
+```{r eval=FALSE, echo=FALSE}
+memory_df<-all_reduced4[,c(1:4,which(str_detect(names(all_reduced4),"Memory_space_usage")))]
+memory_df_min <-memory_df[,c(1:14)]
+memory_df_mean <-memory_df[,c(1:4,15:24)]
+memory_df_max <-memory_df[,c(1:4,25:34)]
+```
+
+```{r eval=FALSE, echo=FALSE}
+
+for ( i in c(5,15,25,6,16,26,7,17,27,8,18,28)) {
+  print( qplot(x=memory_df[,i], main = names(memory_df)[i]))
+}
+```
+
+```{r eval=FALSE, echo=FALSE}
+memory_df_mean[1:1000,] %>%
+  ungroup()%>%
+  ggplot(aes(x=aggTime, y= names(memory_df_mean)[5] ))+geom_line()
+
+```

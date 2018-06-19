@@ -1,0 +1,383 @@
+---
+title: "HW_Credit_Card_Fraud"
+author: "Elijah Hall"
+date: "June 11, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Case 3: Credit Card Fraud 
+ 
+  Credit card fraud happens basically in two types: 1) Application fraud: similar to identity fraud that one person uses another person's personal data to obtain a new card. 2) Transaction fraud: When a card is stolen or a lost card is obtained to conduct fraudulent transactions. A fraudster will try to abuse the card as much as possible in a short period of time before the card is detected and suspended. So we should see **abnormal transactions** in a **short period of time**. (Infromation taken from course presentation, an introduction to Credit Card Fraud)
+
+### Oklahoma purchase credit card transactions
+
+The Office of Management and Enterprise Services in the State of Oklahoma has made its [purchase credit card transactions](https://catalog.data.gov/dataset/purchase-card-pcard-fiscal-year-2014) available. This dataset contains information on purchases made through the purchase card programs administered by the state and higher education institutions. 
+
+
+- Each feature or discussion is a new lead. Structure your EDA for different leads with sub-sections. Each sub-section will cover the following:
+    - Lead: Write what you are going to do in two to three sentences.
+    - Analysis: your EDA
+    - Conclusion: What is the business insight? How can this feature help prediction? Write a short conclusion in the end of each sub-section. 
+
+-  Submit in the HTML format.  
+
+```{r libraries , message=FALSE}
+library(rmarkdown)
+library(tidyverse)
+library(lubridate)
+library(data.table)
+
+library(TTR)
+library(zoo)
+library(cumstats)
+library(corrplot)
+```
+
+```{r helper functions}
+
+
+```
+
+### Exploratory Data Analysis
+
+You can also embed plots, for example:
+
+```{r data, echo=FALSE}
+ccdf <-fread("res_purchase_card_(pcard)_fiscal_year_2014_3pcd-aiuu.csv")
+# meta<- fread("CreditCard_Metadata.txt") #Not separated with normal comma notation
+
+```
+
+```{r}
+dim(ccdf)
+summary(ccdf)
+colnames(ccdf)
+```
+So the data set is 442,458 rows by 11 columns. The different variable types will need to explored and set to make for easier analysis. First I want to rename the variables to make for easier use. Then I will explore each variable.
+```{r}
+#rename columns
+colnames(ccdf)<-c('Year_Month', 'Agency_Number', 'Agency_Name', 'Cardholder_Last_Name',
+      'Cardholder_First_Initial', 'Description', 'Amount', 'Vendor', 'Transaction_Date',
+      'Posted_Date', 'Merchant_Category')
+
+# Count of agencies
+length(unique(ccdf$Agency_Name))
+# 124
+
+# Count of Vendor
+length(unique(ccdf$Vendor))
+# 86,729
+
+# Count of Merchant_Category
+length(unique(ccdf$Merchant_Category))
+# 435
+```
+
+```{r}
+#convert dategorical variables to factors
+ccdf$Agency_Name<- factor(ccdf$Agency_Name)
+ccdf$Vendor <- factor(ccdf$Vendor)
+ccdf$Merchant_Category <- factor(ccdf$Merchant_Category)
+ccdf$Description<- factor(ccdf$Description)
+
+#combine Last name and First initial and reduce variabels by removing last name and first initial variables
+ccdf <- ccdf%>%
+  mutate(Last.FI = paste0(Cardholder_Last_Name,".",Cardholder_First_Initial))
+ccdf <- ccdf[, c(1,2,3,12,6,7,8,9,10,11)]
+
+#convert times to DTG type, note that the H:M:S are all "12:00:00 AM"
+ccdf$Transaction_Date <- mdy_hms(ccdf$Transaction_Date)
+ccdf$Posted_Date <- mdy_hms(ccdf$Posted_Date)
+head(ccdf$Transaction_Date,10)
+head(ccdf$Posted_Date,10)
+
+```
+
+```{r}
+#create a summarized df
+stat_by_agency <- ccdf %>% group_by(Agency_Name) %>%
+    summarise(count = n(),
+              amount = sum(Amount),
+              mean = mean(Amount),
+              min = min(Amount),
+              max = max(Amount)
+             ) %>%
+    arrange(desc(amount)) %>% ungroup() 
+
+#create additional variables
+stat_by_agency <- stat_by_agency %>%
+    mutate(row = rep(1:nrow(stat_by_agency)),
+          Agency_Name_ind = paste(row,Agency_Name,sep="_"),
+          percent = amount/sum(amount)) %>%
+    select(Agency_Name_ind,count, amount, percent,mean, min, max)
+
+head(stat_by_agency)
+
+# Simple Bar Plots 
+temp <-stat_by_agency[1:30,]
+barplot(temp$amount,names.arg=temp$Agency_Name_ind,
+main="Amount by agency name",las=2       )
+
+barplot(temp$count,names.arg=temp$Agency_Name_ind,
+main="Count by agency name in order of amount",las=2       )
+
+barplot(temp$mean,names.arg=temp$Agency_Name_ind,
+main="Avg Amount by agency name",las=2       )
+```
+```{r}
+stat_by_merchant_category <- ccdf %>% group_by(Merchant_Category) %>%
+    summarise(count = n(),
+              amount = sum(Amount),
+              mean = mean(Amount),
+              min = min(Amount),
+              max = max(Amount)
+             ) %>%
+    arrange(desc(amount)) %>% 
+  ungroup() 
+
+#create additional variables
+stat_by_merchant_category <- stat_by_merchant_category %>%
+    mutate(row = rep(1:nrow(stat_by_merchant_category)),
+          Merchant_Category_ind = paste(row,Merchant_Category,sep="_"),
+          percent = amount/sum(amount)) %>%
+    select(Merchant_Category_ind,count, amount, percent,mean, min, max)
+
+head(stat_by_merchant_category)
+# Simple Bar Plot 
+temp <-stat_by_merchant_category[1:30,]
+barplot(temp$amount,names.arg=temp$Merchant_Category_ind,
+main="Amount by Merchant Category",las=2       )
+
+barplot(temp$count,names.arg=temp$Merchant_Category_ind,
+main="Count by Merchant Category in order of Amount",las=2       )
+
+barplot(temp$mean,names.arg=temp$Merchant_Category_ind,
+main="Avg Amount by Merchant Category in order of Total Amount",las=2       )
+
+```
+
+It definately looks like a few agencies represent the majority of transactions. Lets expolore the transactions of the top three: OKLAHOMA STATE UNIVERSITY, UNIVERSITY OF OKLAHOMA, and UNIV. OF OKLA. HEALTH SCIENCES CENTER.
+```{r}
+# EDA for OKLAHOMA STATE UNIVERSITY transactions
+OSU_df<- ccdf%>% 
+  group_by(Agency_Name)%>%
+  filter(Agency_Name=="OKLAHOMA STATE UNIVERSITY")
+
+hist(OSU_df$Amount)
+summary(OSU_df$Amount)
+
+length(OSU_df$Merchant_Category[which(OSU_df$Amount < -1000)])
+
+
+
+```
+
+### Featrue engineering
+
+  For these features I will focus on the [Recency, Frequency, Monetary (RFM)]( ) structured analysis.
+  
+  To assign customer events to RFM cells, the three RFM variables are turned into quantiles. 
+  
+  *Recency* - the number of days or weeks since the last purchase - is used to assign the R score, typically by dividing the values into three groups (terciles) or fi  ve groups (quintiles). This is important and can be used for various time windows. Early identification will want to explore the smallest windows to be able to identify and stop as early as possible fraudulent activity. 
+  
+  The second variable, *Frequency*, is usually defined as the total number of previous purchases. Customers are given F scores based on their frequency quantile. Many faudsters test the card at specific places such as a gas station or convenient store before starting a spree of purchases. 
+  
+  The last variable, *Monetary*, is total lifetime spending, which is used to create M scores. This can be broken down into many categories depending onthe context. But knowing the average spending habits of a customer and range of spending at types of stores is important to detect anomalies.
+  
+Reference: Linoff, Gordon, and Michael J. A. Berry. Data Mining Techniques: For Marketing ; Sales ; and Customer Relationship Management . 3rd ed., John Wiley & Sons Incorporated, 2011.
+
+- Lead: Write what you are going to do in two to three sentences.
+    - Analysis: your EDA
+    - Conclusion: What is the business insight? How can this feature help prediction? Write a short
+
+"avg maximum adjusted by time, day, week, etc..."
+"create maximum or avg per merchants by time, day, week, etc..."
+"avg spending by industry or SIC code if you can identify the industry"
+
+### Feature engineering: Recency
+
+#### Helper function
+  I attempted to make the function to adjust for different times but couldn't find a way to subset by mutiple categorical variables and wouldn't eat up massive amount of processing time.
+```{r eval=FALSE}
+"create function to adjust time variables such as rolling average by day, week, 2 week, month, etc"
+moving_avg<- function (x, frequency = c("day","week","2week", "month", "3month"), time.var.name) {
+  if(frequency == "day"){
+    t = 1
+    means
+  } else if(frequency == "week"){
+    t = 7
+  } else if(frequency == "2week"){
+    t = 14
+  } else if(frequency == "month"){
+     t = 30
+  } else if(frequency == "3month"){
+    t = 90
+  } else{
+    stop("Must assign one of the following: day, week, 2week, month, 3month in quotes")
+  }
+
+
+adj_dates <- ymd(x$time.var.name) - dday(t-1)
+
+means<- vector("numeric", length = nrow(x))
+
+for(i in 1:nrow(x)) {
+  x_sub<-x$amount.name[ymd(x$time.var.name) - dday(t-1):ymd(x$time.var.name)]
+  means[i] 
+}
+
+
+return(means)
+
+}
+
+#Testing strategies
+ccdf<-ccdf%>%
+  group_by(Agency_Name, Transaction_Date)%>%
+  arrange(Agency_Name, Transaction_Date)%>%
+  mutate(daymean = mean(Amount))
+
+all_dates<- unique(ccdf$Transaction_Date)
+all_agency<- unique(ccdf$Agency_Name)
+means<- c()
+for(i in 1:length(all_dates)){
+  idx <- which(ymd(ccdf$Transaction_Date)==ymd(all_dates[i]))
+  for( j in 1:length(all_agency)){
+    sub_df<-ccdf[idx,]
+    idj<-which(sub_df$Agency_Name == all_agency[j])
+    means<- c(means, mean(sub_df$Amount[idj], na.rm = T))
+  }
+}
+#not working
+
+test<-ccdf[which(ymd(ccdf$Transaction_Date) == ymd(all_dates[1])),]
+test<-test[which(test$Agency_Name == all_agency[1]),]
+
+day_means<- vector("numeric", length= nrow(ccdf))
+for(i in 1:length(idx)){
+  day_means[unlist(idx[i])]<-means[i]
+}
+
+ccdf$day_means<-day_means
+
+
+
+
+```
+  
+
+#### Feature 1: Create timestamp
+
+  The first feature is the one demonstated in class. This is to create a timestamp and time between transactions. This is important as mentioned above to identify those points were transactions are purchased with little time between. This goes to understanding normal beahvior of the client and identifying those that are not normal.
+
+```{r}
+time_by_agency <- ccdf %>% 
+    group_by(Agency_Name) %>%
+    arrange(Agency_Name,Transaction_Date) %>%
+    mutate(time = ymd(Transaction_Date)-lag(ymd(Transaction_Date)) ) 
+    
+time_by_agency[,c("Agency_Number","Agency_Name", "Transaction_Date", "time")]
+```
+
+
+```{r}
+ggplot(time_by_agency, aes(x=as.factor(time)))+geom_histogram(stat= "count")
+
+#look at the right tail
+ggplot(time_by_agency[which(time_by_agency$time>5),], aes(x=as.factor(time)))+geom_histogram(stat= "count")
+ggplot(time_by_agency[which(time_by_agency$time>15),], aes(x=as.factor(time)))+geom_histogram(stat= "count")
+
+
+```
+
+Looking at this most transactions are made with less than a 2 days between transactions. However this is not surprising. Also we expect that fraudsters will want to make as many transactions as possible before they are caught. So the likelihood of a fraudster making a transaction more than 2 days apart is low.
+
+### Feature engineering: Frequency
+  
+  As mentioned Frequency is a very important measurment to observe when trying to catch credit fraud. We want explore these kinds of features a bit more and create some intuitive measurements.
+  
+  Let's use one Agency, DEPARTMENT OF EDUCATION,  to look at.
+```{r}
+    
+doe_df<-time_by_agency %>% 
+  filter(Agency_Number ==26500) %>% 
+  group_by(Vendor,Merchant_Category)
+```
+#### Total number of transactions with same merchant during past 30 days
+
+  People tend to visit certain types of places with different frequencies. You will go to a grocery store more often than an auto mechanic. This behavior will be relatively constant and any deviations from these patterns should be identified.
+
+```{r, eval=FALSE}
+ccdf3<- ccdf%>%
+  group_by(Merchant_Category, Transaction_Date)%>%
+  summarise(count=n())
+
+last_30<- c()
+for(i in 1:nrow(ccdf3)){
+  i-1
+  sub <- ccdf3[which(ccdf3$Merchant_Category == ccdf3$Merchant_Category[i]),]
+  dates<- seq.Date(ymd(sub$Transaction_Date[i])-ddays(30), ymd(sub$Transaction_Date[i]), by = "days")
+  
+  last_30[i]<- sub[which(ymd(dates) %in% ymd(sub$Transaction_Date)),]
+}
+
+
+
+
+which(ymd(doe_df_counts$Transaction_Date)<= ymd(doe_df_counts$Transaction_Date[10]) & ymd(doe_df_counts$Transaction_Date) > ymd(doe_df_counts$Transaction_Date[10]) - ddays(30) )
+
+
+all_dates<- unique(doe_df_counts$Transaction_Date)
+last30<- vector()
+for(i in 1:length(all_dates)){
+  idx <- which(ymd(doe_df_counts$Transaction_Date)==ymd(all_dates[i]))
+  sub_df<-doe_df_counts[idx,]
+  last30[i]<- c(means, mean(sub_df$Amount[idj], na.rm = T))
+}          
+            
+
+
+```
+  I couldn't find a reasonable way to measure the difference in time for the past 30 days.
+
+### Feature engineering: Monetary
+
+Create features that identify the amounts that our outside the normal distributions. One factor in identifying unusual activity is if the amount being charged is not likely to be observed 
+
+#### Average amount spent per transaction over a month on all transactions
+
+```{r}
+ccdfm<- ccdf%>%
+  group_by(Last.FI, Merchant_Category, Year_Month)%>%
+  summarise(count= n(),
+            avg= round(mean(Amount)),
+            min= min(Amount),
+            max= max(Amount))%>%
+  ungroup()
+
+head(ccdfm,15)
+
+summary(ccdfm)
+
+
+```
+This shows that some max value as high as $1.9 million and min value as low as -$42,863. I was not expecting that. It looks like some kind of funding for large projects. lets look at the distributions of these.
+
+```{r}
+# transactions over $1mil
+ccdf[which(ccdf$Amount>1000000),]
+
+hist(ccdfm$avg[-c(1:43)])
+
+```
+As the summary stats showed there are so many observations in the 0-500 range that when the extreme values are included they make it difficult to see the overall distribution.So Lets pick on person.
+```{r}
+hist(ccdfm$avg[c(46:76)])
+
+ggplot(ccdfm[c(46:76),], aes(x=c(1:length(46:76)), y=avg)) + geom_line()
+```
+
+

@@ -1,0 +1,632 @@
+---
+title: "HW4HealthCare"
+author: "Elijah Hall"
+date: "June 14, 2018"
+output: 
+  prettydoc::html_pretty:
+  theme: ar
+highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+## EDA of Health Care Data
+
+
+```{r libraries, message=FALSE}
+library(rmarkdown)
+library(tidyverse)
+library(data.table)
+library(zipcode)
+library(lubridate)
+library(scales)
+library(plotly)
+library(corrplot)
+```
+
+```{r functions}
+abb2state <- function(name, convert = F, strict = F){
+  data(state)
+  # state data doesn't include DC
+  state = list()
+  state[['name']] = c(state.name,"District Of Columbia")
+  state[['abb']] = c(state.abb,"DC")
+  
+  if(convert) state[c(1,2)] = state[c(2,1)]
+  
+  single.a2s <- function(s){
+    if(strict){
+      is.in = tolower(state[['abb']]) %in% tolower(s)
+      ifelse(any(is.in), state[['name']][is.in], NA)
+    }else{
+      # To check if input is in state full name or abb
+      is.in = rapply(state, function(x) tolower(x) %in% tolower(s), how="list")
+      state[['name']][is.in[[ifelse(any(is.in[['name']]), 'name', 'abb')]]]
+    }
+  }
+  sapply(name, single.a2s)
+} # https://gist.github.com/ligyxy/acc1410041fe2938a2f5
+
+#4 outlier detection functions found at
+#http://www.questionflow.org/2017/12/26/combined-outlier-detection-with-dplyr-and-ruler/
+
+#the tree functions below take vectors
+#Z-score, also called a standard score, of an observation is [broadly speaking] a distance from the population center measured in number of normalization units. The default choice for center is sample mean and for normalization unit is standard deviation.⬛ Observation is not an outlier based on z-score if its absolute value of default z-score is lower then some threshold (popular choice is 3).
+
+isnt_out_z <- function(x, thres = 3, na.rm = TRUE) {
+  abs(x - mean(x, na.rm = na.rm)) <= thres * sd(x, na.rm = na.rm)
+}
+
+#Median Absolute Deviation is a robust normalization unit based on median as a population center. In order to use MAD “as a consistent estimator for the estimation of the standard deviation” one takes its value multiplied by a factor. This way base R function mad is implemented. Observation is not an outlier based on MAD if its absolute value of z-score with median as center and MAD as normalization unit is lower then some threshold (popular choice is 3)
+
+isnt_out_mad <- function(x, thres = 3, na.rm = TRUE) {
+  abs(x - median(x, na.rm = na.rm)) <= thres * mad(x, na.rm = na.rm)
+}
+
+#Tukey’s fences is a technique used in box plots. The non-outlier range is defined with [Q1−k(Q3−Q1), Q3+k(Q3−Q1)], where Q1 and Q3 are the lower and upper quartiles respectively, k - some nonnegative constant (popular choice is 1.5).⬛ Observation is not an outlier based on Tukey’s fences if its value lies in non-outlier range.
+
+isnt_out_tukey <- function(x, k = 1.5, na.rm = TRUE) {
+  quar <- quantile(x, probs = c(0.25, 0.75), na.rm = na.rm)
+  iqr <- diff(quar)
+  
+  (quar[1] - k * iqr <= x) & (x <= quar[2] + k * iqr)
+}
+
+#The function below takes a df
+#All previous approaches were created for univariate numerical data. To detect outliers in multivariate case one can use Mahalanobis distance to reduce to univariate case and then apply known techniques.⬛ Observation is not an outlier based on Mahalanobis distance if its distance is not an outlier.
+
+maha_dist <- . %>% select_if(is.numeric) %>%
+    mahalanobis(center = colMeans(.), cov = cov(.))
+
+isnt_out_maha <- function(tbl, isnt_out_f, ...) {
+  tbl %>% maha_dist() %>% isnt_out_f(...)
+}
+
+
+```
+
+
+```{r variables and objects}
+  mytheme <- theme_bw()+
+  theme(panel.border = element_blank(),
+        axis.line = element_line(color = 'black'),
+        plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+
+#group the first three outlier detection functions
+isnt_out_funs <- funs(
+  z = isnt_out_z,
+  mad = isnt_out_mad,
+  tukey = isnt_out_tukey
+)
+```
+
+### Healthcare - the cost of quality - C
+Q. What is the cost of a medical provider compared to its state?
+Q. What is the rationale of statewide comparison?
+Does state comparison for all treatment make sense? What is a better comparison at the state level?
+
+```{r }
+#load in data
+payment<- fread("Inpatient_Payment_System.csv")
+
+#fix names 
+names(payment)<- str_replace_all(names(payment),pattern = " ", replacement = ".")
+
+summary(payment)
+```
+
+After looking at the data I want to see how many unique values there are for each column.
+```{r}
+# how many unique values per variable
+for (i in 1:ncol(payment)){
+  print(paste("Column",i, ",", names(payment)[i],", length =",  length(t(unique(payment[,..i])))))
+}
+
+```
+
+It looks like good categorical variables to use would be DRG.Definition, Provider.Id or Provider.Name, and Provider.State. Where good columns to aggregate on are Total.Discharges, Average.Covered.Charges, Average.Total.Payments, and Average.Medicare.Payments.
+
+```{r}
+
+av1 <- payment[,Average.Covered.Charges,by=Provider.State]
+ggplot(data = av1,mapping = aes(y = Provider.State,x = Average.Covered.Charges,colour=Average.Covered.Charges))+
+  mytheme+
+  geom_point()
+```
+
+Some states seem to have high Average.Covered.Charges where others have lower. I might want to look for a good variable that I could cluster on for future analysis.
+
+```{r}
+
+#take another look at distribution by state and possible outliers
+boxplot(split(av1$Average.Covered.Charges,f=av1$Provider.State))
+
+```
+  These plots show distributions similar to eachother with large amounts of outliers that make it hard to visualy see a differnce in samples. So I want to perform a one-way Anova test to determine if all there is evidence to believe that the distribution of Average.Covered.Charges differs by state.The null hypothesis,H~0~, is that state means are the same or that they come from the same population distribution. The alternative hypothesis, H~A~, is that there are at least two state means that are statistically significantly different from each other. This is evidence that the state distributions are not likely from the same population distribution.
+```{r}
+#perofrm one-way Anova test 
+res.av1<- aov(Average.Covered.Charges ~ Provider.State, data = av1)
+
+#review output
+summary(res.av1)
+
+```
+
+The F-statistic is very high and the p-value is very low giving strong evidence that we should reject the null hypothesis, H~0~.
+
+### Feature 0: Region
+
+I want to investigate the regions of the US and see if there is much difference at a higher level. If it is, then I can use this for future features.
+
+```{r}
+#create category for  Northeast,  Midwest, South, and West
+Northeast<- c("Connecticut", "Maine", "Massachusetts", "New Hampshire", "Rhode Island", "Vermont", "New Jersey", "New York", "Pennsylvania")
+names(Northeast)<- rep("Northeast", length(Northeast))
+
+Midwest <- c("Illinois", "Indiana", "Michigan", "Ohio",  "Wisconsin", "Iowa", "Kansas", "Minnesota", 'Missouri', 'Nebraska', 'North Dakota', 'South Dakota')
+names(Midwest)<- rep("Midwest", length(Midwest))
+
+South<- c("Delaware", "Florida", "Georgia", "Maryland", "North Carolina", 'South Carolina', 'Virginia', 'District of Columbia',  'West Virginia', 'Alabama', 'Kentucky', 'Mississippi',  'Tennessee', 'Arkansas', 'Louisiana', 'Oklahoma', 'Texas')
+names(South)<- rep("South", length(South))
+
+West<- c('Arizona', 'Colorado', 'Idaho', 'Montana', 'Nevada', 'New Mexico', 'Utah',  'Wyoming', 'Alaska', 'California', 'Hawaii', 'Oregon',  'Washington')
+names(West)<- rep("West", length(West))
+
+#create df to hold all values for regions
+region_df<- data.frame( sort(c(Northeast,Midwest, South, West)), names(sort(c(Northeast,Midwest, South, West))))
+names(region_df)<- c("State", "Region")
+
+#create abbreviations to match on
+region_df$Provider.State <- abb2state(region_df$State,convert=T)
+
+#create vector of regions to cbind with av1
+region<- c("character", length= nrow(av1))
+for (i in 1:nrow(region_df)){
+  
+idx<-which(av1$Provider.State == region_df$Provider.State[i])
+region[idx]<-as.character(region_df$Region[i])
+
+}
+
+av1<- cbind(av1,region)
+
+boxplot(split(av1$Average.Covered.Charges,f=av1$region))
+```
+
+It is hard to see the distribution with this graph because there are a lot of extreme outliers. So I will perform another one-way Anova like before.
+
+```{r}
+res.av1<- aov(Average.Covered.Charges ~ region, data = av1)
+summary(res.av1)
+
+```
+The F-statistic is very high and the p-value is very low, again, giving strong evidence that we should reject the null hypothesis, H~0~. 
+
+Now I want to look at the same for Average.Total.Payments.
+
+```{r}
+av2 <- payment[,Average.Total.Payments,by=Provider.State]
+
+ggplot(data = av2,mapping = aes(y = Provider.State,x = Average.Total.Payments,colour=Average.Total.Payments))+
+  mytheme+
+  geom_point()
+```
+
+
+```{r}
+
+#take another look at distribution by state and possible outliers
+boxplot(split(av2$Average.Total.Payments,f=av2$Provider.State))
+```
+
+These plots share the same limitations in interpreting patterns. So I will try to aggregate on regions.
+
+```{r}
+#create vector of regions to cbind with av2
+region<- c("character", length= nrow(av2))
+for (i in 1:nrow(region_df)){
+  
+idx<-which(av2$Provider.State == region_df$Provider.State[i])
+region[idx]<-as.character(region_df$Region[i])
+
+}
+
+av2<- cbind(av2,region)
+
+```
+
+```{r}
+boxplot(split(av2$Average.Total.Payments, f=av2$region))
+```
+
+Like before the outliers make it hard to interpret. So back to the one-way Anova.
+
+```{r}
+res.av2<- aov(Average.Total.Payments ~ region, data = av2)
+summary(res.av2)
+```
+The F-statistic is very high and the p-value is very low, again, giving strong evidence that we should reject the null hypothesis, H~0~.
+
+
+Maybe visualizing location will help in understanding how to cluster the providers.
+
+```{r message=FALSE}
+V1 <- payment %>% # aggregate procedures for each hospital
+  group_by(Provider.Id, Provider.Zip.Code, Provider.Name) %>% # keep zip & name
+  summarise(procSum = sum(Total.Discharges) ) 
+
+#read in data for zipcode
+data(zipcode)
+
+# merge aggregated hospital data with zipcode, copy lat+lon for each hospital
+V2 <- merge(V1,zipcode, by.x= "Provider.Zip.Code", by.y= "zip")
+
+g <- list( 
+  scope = 'usa',
+  projection = list(type = 'albers usa'),
+  showland = TRUE,
+  subunitwidth = 1,
+  countrywidth = 1
+)
+V1 <- payment %>% # aggregate procedures for each hospital
+  group_by(Provider.Id, Provider.Zip.Code, Provider.Name) %>% # keep zip & name
+  summarise(procSum = sum(Total.Discharges) ) 
+
+V2 <- merge(V1,zipcode, by.x= "Provider.Zip.Code", by.y= "zip")
+
+attach(V2)
+k<- plot_ly(V2, lon = longitude, lat = latitude, 
+        text = paste(Provider.Name, city,procSum, sep = "\n"),
+        marker = list(size = sqrt(procSum/50) + 1, line = list(width = 0)),
+        type = 'scattergeo', locationmode = 'USA-states') %>%
+  layout(title = 'aggregated procedure counts at US hospitals', geo = g)
+k
+
+```
+
+After looking into this feature of region I don't think it will be as usefull as a basic k-means clustering.
+
+### Visualize Diagnosis-Related Group (DRG) Statistics to identify top influencers.
+
+  The DRG classification system divides possible diagnoses into more than 20 major body systems and subdivides them into almost 500 groups for Medicare reimbursement. Some factors used to determine the DRG payment amount include the diagnosis involved as well as the hospital resources necessary to treat the condition. Also used by a few states for all payers and by many private health plans (usually non-HMO) for contracting purpose. 
+
+
+```{r}
+library(class)
+
+DRG_summary_stats<- payment%>%
+  group_by(DRG.Definition)%>%
+  summarize(total_pt_count = sum(Total.Discharges),
+            avg_covered = mean(Average.Covered.Charges),
+            avg_total = mean(Average.Total.Payments),
+            avg_medicare = mean(Average.Medicare.Payments),
+            total_payment = avg_total*total_pt_count)%>%
+  arrange(desc(total_payment))%>% 
+  ungroup() 
+
+DRG_summary_stats<- DRG_summary_stats%>%
+  mutate(row = rep(1:nrow(DRG_summary_stats)),
+         DRG.Definition = paste(row,DRG.Definition,sep="_"))%>%
+  select(1:6)
+
+#visualize
+temp <-DRG_summary_stats[1:30,]
+
+barplot(temp$total_payment,names.arg=temp$DRG.Definition,
+main="Total Payment by DRG",las=2)
+
+barplot(temp$total_pt_count,names.arg=temp$DRG.Definition,
+main="Total Patient Count by DRG",las=2)
+
+barplot(temp$avg_covered,names.arg=temp$DRG.Definition,
+main="Average Covered Charges by DRG",las=2)
+
+barplot(temp$avg_total,names.arg=temp$DRG.Definition,
+main="Average Total Payments by DRG",las=2)
+
+barplot(temp$avg_medicare,names.arg=temp$DRG.Definition,
+main="Average Medicare Payments by DRG",las=2)
+
+```
+
+After looking at these graphs I decided to subset the data selecting the top 6 DRG's since for average total payments the largest by far was ranked 6 in total payments. This could be significant as it seems to be a very expensive procedure and which would make it a good target to tack on smaller payments that might go unnotices through upcoding or unbundling. Even though I can't confirm this activity through the data, anomolous activities might be an indicator.
+
+```{r}
+#assign clusters
+provider_clusts<- kmeans(payment[,c(2,9:12)]%>%
+                           na.omit()%>%
+                           group_by(Provider.Id),centers = 4)
+
+#combine cluster assignments to df
+payment_clust<- cbind(payment, provider_clusts$cluster)
+
+#rename cluster variable
+names(payment_clust)[13]<- "Cluster"
+```
+```{r echo=FALSE, eval=FALSE}
+#assign cluster for which majority assigned
+payment_clust%>%
+  group_by(Provider.Id)%>%
+  select(Provider.Id,Cluster)%>%
+  summarize(mean = round(mean(Cluster)))
+```
+
+```{r}
+#distibution of clusters
+count_prop_df<- data.frame(table(payment_clust$Cluster),prop.table(table(payment_clust$Cluster)))[,c(1,2,4)]
+names(count_prop_df)<- c("Cluster", "Count", "Proportion")
+count_prop_df
+
+```
+
+One Cluster has very few obervations
+
+```{r}
+#subset on top 6 DRG's to rerun clustering
+top_6_DRG<- payment%>%
+  group_by(DRG.Definition)%>%
+  summarize(total_pt_count = sum(Total.Discharges),
+            avg_covered = mean(Average.Covered.Charges),
+            avg_total = mean(Average.Total.Payments),
+            avg_medicare = mean(Average.Medicare.Payments),
+            total_payment = avg_total*total_pt_count)%>%
+  arrange(desc(total_payment))%>% 
+  ungroup()
+
+top_6_DRG<-top_6_DRG$DRG.Definition[1:6]
+
+payment_top_6_DRG <- payment %>%
+  filter(DRG.Definition == top_6_DRG)%>%
+  ungroup()
+```
+
+### Feature 1: Cluster Providers on top DRG
+
+  After subsetting the dataset to just the top 6 DRG's, I want to look at how they migh cluster based on the metrics provided. If the united states is diversified into categories base on income and standard of living then it stands to reason that the hospitals in those regions are going to behave differently. I will choose 4 groups. I know traditional groups for income class in the US are Upper, Middle, and Low. However I want to identify a forth group that might be outside the standard 3 groups. Additionally regions are grouped into 4 subgroups and so intution is driving me to choose 4.
+```{r}
+
+#assign clusters
+provider_clusts<- kmeans(payment_top_6_DRG[,c(2,9:12)],centers = 4)
+
+#combine cluster assignments to df
+payment_clust<- cbind(payment_top_6_DRG, provider_clusts$cluster)
+
+#rename cluster variable
+names(payment_clust)[13]<- "Cluster"
+```
+```{r eval= FALSE, echo=FALSE}
+#look at cluster for which majority assigned
+"payment_clust%>%
+  group_by(Provider.Id)%>%
+  select(Provider.Id,Cluster)%>%
+  summarize(mean = median(Cluster))"
+```
+```{r}
+#distibution of clusters
+count_prop_df<- data.frame(table(payment_clust$Cluster),prop.table(table(payment_clust$Cluster)))[,c(1,2,4)]
+names(count_prop_df)<- c("Cluster", "Count", "Proportion")
+count_prop_df
+
+```
+
+One Cluster is significantly smaller than the others jsut like before and the proportion appears to be very similar. Maybe visualizing the clusters by location will help identify the reason.
+
+```{r}
+payment_clust$Cluster<- factor(payment_clust$Cluster, levels = c(1,2,3,4))
+
+V1 <- payment_clust %>% # aggregate procedures for each hospital
+  group_by(Provider.Id, Provider.Zip.Code, Provider.Name,Cluster) %>% # keep zip & name
+  summarise(procSum = sum(Total.Discharges) ) 
+
+# merge aggregated hospital data with zipcode, copy lat+lon for each hospital
+V2 <- merge(V1,zipcode, by.x= "Provider.Zip.Code", by.y= "zip")
+
+g <- list(
+  scope = 'usa',
+  projection = list(type = 'albers usa'),
+  showland = TRUE,
+  landcolor = toRGB("gray85"),
+  subunitwidth = 1,
+  countrywidth = 1,
+  subunitcolor = toRGB("white"),
+  countrycolor = toRGB("white")
+)
+
+p <- plot_geo(V2, locationmode = 'USA-states', sizes = c(1, 250)) %>%
+  add_markers(
+    x = ~longitude, y = ~latitude, size = ~procSum, color = ~Cluster, hoverinfo = "text",
+    text = ~paste(V2$Provider.Id, "<br />", V2$procSum)
+  ) %>%
+  layout(title = 'Aggregated Discharges at US Hospitals by Cluster <br>(Click legend to toggle)', geo = g)
+
+p
+```
+
+The clusters are not immediately obvious as to why they were designated. Maybe 3 clusters would be better. these clusters could be identifying state patterns on medical regulation. Isay this becuuse the clusters seem to be consistant across states with a few expetions. Maybe these should be identified as possible targets for further investigation.
+
+Let's look at Florida and the cluster assignments there. 
+
+```{r}
+
+FL_df<- payment_clust%>%
+  filter(Provider.State=="FL")
+
+#look at cluster distrubutions
+table(FL_df$Cluster)
+```
+```{r}
+
+idx<- which(table(FL_df$Cluster)>0)
+
+FL_df_split<- split(FL_df$Average.Total.Payments,FL_df$Cluster )[idx]
+
+boxplot(FL_df_split)
+```
+
+The Total payments for both groups are dramamticaly different. However, there are only 6 observaitons in cluster 4 in FL. 
+
+### Feature 2 Not in State Cluster
+
+  As seen above the clusters seem to be consistant across states with few exceptions. I want to make a binary variable to identify those that are not consistant with the state median cluster identity. This could be significant as it might be strongly correlated with unbundling or upcoding.
+
+```{r}
+
+#look at all cluster assignments by state
+payment_clust%>%
+  select(Provider.State, Cluster)%>%
+  table()
+```
+
+```{r}
+Median_clust_by_state<- payment_clust%>%
+  ungroup()%>%
+  group_by(Provider.State)%>%
+  summarize(Median_clust = median(as.numeric(Cluster)))
+
+clust_2<- list()
+
+#which cluster is the smallest and not therfore the one that is not grouped by state
+small_clust<- which(table(payment_clust$Cluster)==min(table(payment_clust$Cluster)))
+
+#create state sluster assignemnt
+for(i in c(1:4)[-small_clust]){
+clust_2[i]<-Median_clust_by_state%>%
+  filter(Median_clust==i)%>%
+  select(Provider.State)%>%
+  list()
+}
+
+start_clust <- c(1:4)[-small_clust][1]
+
+#fill in state clusters
+payment_clust$State_Clust<-start_clust
+for(i in c(1:4)[-c(start_clust,small_clust)]){
+  payment_clust$State_Clust[which(payment_clust$Provider.State %in%  t(clust_2[[i]]))]<- i
+}
+
+#create out of cluster binary
+payment_clust<- payment_clust%>%
+  mutate(OOC = as.numeric(Cluster!=State_Clust))
+
+#view frequency of occurance
+sum(payment_clust$OOC)
+  
+```
+ `r percent(mean(payment_clust$OOC))` of occurances occur in OOC. This is what I expect to see in an event that is not normal. These events happen to be mostly cluster `r small_clust`. No state has a median cluster assignment of `r small_clust`.
+
+## Feature 3: Global outliers
+
+  How each hospital is performing compared to its cluster is alos important. Therefore a variable to look at the normalized values and then classifiing outliers based on specific requirements would be nice. Here I want to create an ensomble model using differenet methods to identify outliers. Then I will create one final binary variable to identify global outliers.
+
+```{r}
+
+
+#make Provider ID and Cluster assignments int character to prevent warnings
+payment_clust$Provider.Id<- as.character(payment_clust$Provider.Id)
+payment_clust$Cluster<- as.character(payment_clust$Cluster)
+
+#Identify outliers using the first three functions
+out_df<- payment_clust %>% 
+  group_by(Provider.Id, Provider.Name, Cluster)%>% 
+  select(Provider.Id, Provider.Name, Cluster, Average.Covered.Charges, Average.Medicare.Payments, Average.Total.Payments)%>%
+  transmute_if(is.numeric, isnt_out_funs)%>%
+  ungroup()
+
+summary(out_df[,4:12])
+```
+
+```{r}
+
+#identify outliers using the fourth function nesting the other 3
+out_df2<- payment_clust %>% 
+  transmute(maha = maha_dist(.)) %>%
+  transmute_at(vars(maha = maha), isnt_out_funs)
+
+summary(out_df2)
+```
+
+```{r}
+
+all_out <- cbind(out_df, out_df2)
+
+outlier_idx<- which(rowMeans(all_out[,13:15], na.rm = T)<.5)
+outlier_group_idx<- which(rowMeans(all_out[,7:15], na.rm = T)<.8)
+
+payment_clust$outlier<- 0
+payment_clust$outlier_group<- 0
+
+payment_clust$outlier[outlier_idx]<- 1
+payment_clust$outlier_group[outlier_group_idx]<- 1
+
+#colSums(payment_clust[,15:17])
+
+#create a binary variable to identify any observation identified as an outlier
+payment_clust$is_out<- as.numeric(rowSums(payment_clust[,15:17])!=0)
+
+#single plot of outliers versus non
+ggplot(payment_clust, aes(x= Total.Discharges , y= Average.Total.Payments, col = as.factor(is_out)  )) +
+  mytheme +
+  geom_point(alpha=.5)+
+  scale_colour_manual(values=c("lightblue", "darkblue"), 
+                       name="",
+                       breaks=c("0", "1"),
+                       labels=c("Normal", "Outlier"))
+
+```
+
+```{r}
+
+ggplot(payment_clust, aes(x= Total.Discharges , y= Average.Total.Payments, col = as.factor(is_out) )) +
+  mytheme +
+  geom_point(alpha=.5) +
+  facet_wrap( ~as.character(Cluster)) +
+  scale_colour_manual(values = c("#AAAAAA", "#004080"), 
+                       name="",
+                       breaks=c("0", "1"),
+                       labels=c("Normal", "Outlier")) +
+  guides(colour = guide_legend(title = NULL,
+                               override.aes = list(size = 4))) +
+  labs(title = paste0("Strong outliers illustration by ", as.character(payment_clust$is_out))) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 14))
+
+```
+
+```{r}
+payment_clust$Cluster<- factor(payment_clust$Cluster, levels = c(1,2,3,4))
+
+V1 <- payment_clust %>% # aggregate procedures for each hospital
+  group_by(Provider.Id, Provider.Zip.Code, Provider.Name,is_out) %>% # keep zip & name
+  summarise(procSum = sum(Total.Discharges) ) 
+
+# merge aggregated hospital data with zipcode, copy lat+lon for each hospital
+V2 <- merge(V1,zipcode, by.x= "Provider.Zip.Code", by.y= "zip")
+
+g <- list(
+  scope = 'usa',
+  projection = list(type = 'albers usa'),
+  showland = TRUE,
+  landcolor = toRGB("gray85"),
+  subunitwidth = 1,
+  countrywidth = 1,
+  subunitcolor = toRGB("white"),
+  countrycolor = toRGB("white")
+)
+
+p <- plot_geo(V2, locationmode = 'USA-states', sizes = c(1, 250)) %>%
+  add_markers(
+    x = ~longitude, y = ~latitude, size = ~procSum, color = ~as.factor(is_out), hoverinfo = "text",
+    text = ~paste(V2$Provider.Id, "<br />", V2$procSum)
+  ) %>%
+  layout(title = 'Aggregated Discharges at US Hospitals by Outier <br>(Click legend to toggle)', geo = g)
+
+p
+```
+
+Looking at the map there doesn't seem to be any obvious location for outliers. They seem to be spread throughout the US. I also see that the size of the circles seems to have strong coorelation with outliers. But on further investigation the correlation is only `r cor(payment_clust$Total.Discharges, payment_clust$is_out)` which isn't very stong even if statistically significant. 
+
