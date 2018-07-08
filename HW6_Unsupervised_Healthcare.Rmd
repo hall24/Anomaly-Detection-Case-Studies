@@ -1,0 +1,573 @@
+---
+title: "HW6 Unsupervised Learning HealthCare"
+author: "Elijah Hall"
+date: "July 15, 2018"
+output: 
+  prettydoc::html_pretty:
+  theme: cayman
+highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(knitr.table.format = "html") 
+
+```
+
+## Unsupervised Learning
+
+  This assignment covers two common techniques in unsupervised learning, DSCAN and Hidden Markov Model (HMM). Will be used to explore data that has been adjusted for identifing anomolies. 
+
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(rmarkdown)
+library(tidyverse)
+library(data.table)
+library(zipcode)
+#library(scales)
+library(plotly)
+library(kableExtra)
+library(dbscan)
+library(fpc)
+#library(stats)
+library(ggdendro)
+library(GGally)
+library(pca3d)
+library(factoextra)
+#library(rattle.data)
+library(gridExtra)
+library(depmixS4)
+library(tidyverse)
+#suppressPackageStartupMessages(library(tidyverse))
+library(dplyr)
+```
+
+```{r functions, message=FALSE, warning=FALSE}
+abb2state <- function(name, convert = F, strict = F){
+  data(state)
+  # state data doesn't include DC
+  state = list()
+  state[['name']] = c(state.name,"District Of Columbia")
+  state[['abb']] = c(state.abb,"DC")
+  
+  if(convert) state[c(1,2)] = state[c(2,1)]
+  
+  single.a2s <- function(s){
+    if(strict){
+      is.in = tolower(state[['abb']]) %in% tolower(s)
+      ifelse(any(is.in), state[['name']][is.in], NA)
+    }else{
+      # To check if input is in state full name or abb
+      is.in = rapply(state, function(x) tolower(x) %in% tolower(s), how="list")
+      state[['name']][is.in[[ifelse(any(is.in[['name']]), 'name', 'abb')]]]
+    }
+  }
+  sapply(name, single.a2s)
+} # https://gist.github.com/ligyxy/acc1410041fe2938a2f5
+
+mytheme <- theme_bw()+
+  theme(panel.border = element_blank(),
+        axis.line = element_line(color = 'black'),
+        plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        axis.title.x = element_text(color="black", size=10),
+        axis.title.y = element_text(color="black", size=10)
+        )
+
+#define additional parameters for plotly graphs
+g <- list(
+  scope = 'usa',
+  projection = list(type = 'albers usa'),
+  showland = TRUE,
+  landcolor = toRGB("gray85"),
+  subunitwidth = 1,
+  countrywidth = 1,
+  subunitcolor = toRGB("white"),
+  countrycolor = toRGB("white")
+)
+
+m <- list(
+  l = 50,
+  r = 50,
+  b = 100,
+  t = 100,
+  pad = 4
+)
+
+```
+
+
+```{r data}
+#load in data
+payment<- fread("Inpatient_Payment_System.csv")
+
+#fix names 
+names(payment)<- str_replace_all(names(payment),pattern = " ", replacement = ".")
+payment<- as.data.frame(payment)
+idx<- as.numeric(which(unlist(map(payment[1,], is.numeric)))) #2 and 7 are id variables
+
+kable(summary(payment[,9:12]))
+
+kable(head(payment))
+
+```
+
+## Feature Engineering
+
+  The engineered features are ratios of the given variables by provider to their state.
+```{r regions}
+#create category for  Northeast,  Midwest, South, and West
+Northeast<- c("Connecticut", "Maine", "Massachusetts", "New Hampshire", "Rhode Island", "Vermont", "New Jersey", "New York", "Pennsylvania")
+names(Northeast)<- rep("Northeast", length(Northeast))
+
+Midwest <- c("Illinois", "Indiana", "Michigan", "Ohio",  "Wisconsin", "Iowa", "Kansas", "Minnesota", 'Missouri', 'Nebraska', 'North Dakota', 'South Dakota')
+names(Midwest)<- rep("Midwest", length(Midwest))
+
+South<- c("Delaware", "Florida", "Georgia", "Maryland", "North Carolina", 'South Carolina', 'Virginia', 'District of Columbia',  'West Virginia', 'Alabama', 'Kentucky', 'Mississippi',  'Tennessee', 'Arkansas', 'Louisiana', 'Oklahoma', 'Texas')
+names(South)<- rep("South", length(South))
+
+West<- c('Arizona', 'Colorado', 'Idaho', 'Montana', 'Nevada', 'New Mexico', 'Utah',  'Wyoming', 'Alaska', 'California', 'Hawaii', 'Oregon',  'Washington')
+names(West)<- rep("West", length(West))
+
+#create df to hold all values for regions
+region_df<- data.frame( sort(c(Northeast,Midwest, South, West)), names(sort(c(Northeast,Midwest, South, West))))
+names(region_df)<- c("State", "Region")
+
+#create abbreviations to match on
+region_df$Provider.State <- abb2state(region_df$State,convert=T)
+
+#create vector of regions to cbind
+region<- c("character", length= nrow(payment))
+for (i in 1:nrow(region_df)){
+  
+idx<-which(payment$Provider.State == region_df$Provider.State[i])
+region[idx]<-as.character(region_df$Region[i])
+
+}
+
+payment<- cbind(payment,region)
+remove(region_df)
+```
+
+  I want to aggregate on location and state is a good variable. However I know regions within the US are important and can be used to generalize over groups of population outside of state boundaries. So I will make features specific to region first and then state.
+
+```{r Feature engineer on region}
+
+#ratio of DRG total payments to all payments 
+Region_total <- payment %>% group_by(region) %>%
+       summarise( totals= sum(Total.Discharges*Average.Total.Payments))
+
+payment2<- payment %>% 
+       left_join(Region_total, by=c("region")) %>%
+       mutate( ratio_region_DRG_total_payments=(Total.Discharges*Average.Total.Payments)/totals) %>%
+  dplyr::select(-totals)
+
+remove(Region_total)
+
+DRG_Region_avg <- payment2 %>% group_by(DRG.Definition, region) %>%
+       summarise( mean_ratio_covered_total = mean(Average.Covered.Charges/Average.Total.Payments),
+                  mean_ratio_medicare_total= mean(Average.Medicare.Payments/Average.Total.Payments),
+                  mean_total_discharges          = mean(Total.Discharges),
+                  mean_average_covered_charges   = mean(Average.Covered.Charges),
+                  mean_average_total_payments    = mean(Average.Total.Payments),
+                  mean_average_medicare_payments = mean(Average.Medicare.Payments),
+                  mean_total_payment             = mean_average_total_payments*
+                                                          mean_total_discharges
+                )
+
+# Append the average statistics back to the data to derive the ratios.
+per_provider_reg <- payment2 %>% 
+       left_join(DRG_Region_avg, by=c("DRG.Definition","region")) %>%
+       mutate( reg_ratio_covered_total =(Average.Covered.Charges/Average.Total.Payments)/           mean_ratio_covered_total,
+               reg_ratio_medicare_total =(Average.Medicare.Payments/Average.Total.Payments)/ mean_ratio_medicare_total,
+            reg_ratio_total_discharges          = Total.Discharges/mean_total_discharges,
+            reg_ratio_average_covered_charges   = Average.Covered.Charges/mean_average_covered_charges,
+            reg_ratio_average_total_payments    = Average.Total.Payments/mean_average_total_payments,
+            reg_ratio_average_medicare_payments = Average.Medicare.Payments/mean_average_medicare_payments,
+            reg_ratio_total_payment        = (Total.Discharges*Average.Total.Payments)/mean_total_payment) %>%
+       dplyr::select(-mean_total_discharges,
+              -mean_average_covered_charges,
+              -mean_average_total_payments,
+              -mean_average_medicare_payments,
+              -Total.Discharges,
+              -Average.Covered.Charges,
+              -Average.Total.Payments,
+              -Average.Medicare.Payments,
+              -mean_total_payment,
+              -mean_ratio_covered_total,
+              -mean_ratio_medicare_total
+           ) %>% arrange(Provider.Id, DRG.Definition) 
+
+remove(payment2)
+remove(DRG_Region_avg)
+```
+  
+
+  Now I am going to perform the same steps to engineer state level features.
+
+```{r Feature Engineering by State, echo=FALSE}
+payment<-payment %>% arrange(Provider.Id, DRG.Definition) 
+
+#ratio of DRG total payments to all payments 
+State_total <- payment %>% group_by(Provider.State) %>%
+       summarise( totals= sum(Total.Discharges*Average.Total.Payments))
+
+
+payment3<- payment %>% group_by(Provider.State) %>%
+       left_join(State_total, by=c("Provider.State")) %>%
+       mutate( ratio_DRG_total_payments   = (Total.Discharges*Average.Total.Payments)/totals)%>%
+  dplyr::select(-totals)
+remove(State_total)
+
+DRG_State_avg <- payment3 %>% group_by(DRG.Definition, Provider.State) %>%
+       summarise( mean_ratio_covered_total = mean(Average.Covered.Charges/Average.Total.Payments),
+                  mean_ratio_medicare_total= mean(Average.Medicare.Payments/Average.Total.Payments),
+                  mean_total_discharges          = mean(Total.Discharges),
+                  mean_average_covered_charges   = mean(Average.Covered.Charges),
+                  mean_average_total_payments    = mean(Average.Total.Payments),
+                  mean_average_medicare_payments = mean(Average.Medicare.Payments),
+                  mean_total_payment             = mean_average_total_payments*
+                                                          mean_total_discharges
+                )
+
+# Append the average statistics back to the data to derive the ratios.
+per_provider_state <- payment3 %>% 
+       left_join(DRG_State_avg, by=c("DRG.Definition","Provider.State")) %>%
+       mutate( ratio_covered_total =(Average.Covered.Charges/Average.Total.Payments)/           mean_ratio_covered_total,
+               ratio_medicare_total =(Average.Medicare.Payments/Average.Total.Payments)/ mean_ratio_medicare_total,
+            ratio_total_discharges          = Total.Discharges/mean_total_discharges,
+            ratio_average_covered_charges   = Average.Covered.Charges/mean_average_covered_charges,
+            ratio_average_total_payments    = Average.Total.Payments/mean_average_total_payments,
+            ratio_average_medicare_payments = Average.Medicare.Payments/mean_average_medicare_payments,
+            ratio_total_payment        = (Total.Discharges*Average.Total.Payments)/mean_total_payment) %>%
+       dplyr::select(-mean_total_discharges,
+              -mean_average_covered_charges,
+              -mean_average_total_payments,
+              -mean_average_medicare_payments,
+              -Total.Discharges,
+              -Average.Covered.Charges,
+              -Average.Total.Payments,
+              -Average.Medicare.Payments,
+              -mean_total_payment,
+              -mean_ratio_covered_total,
+              -mean_ratio_medicare_total
+           ) %>% arrange(Provider.Id, DRG.Definition) 
+#%>%
+#           select(Provider.Id,DRG.Definition,Provider.Name,Provider.State,ratio_total_discharges,ratio_average_covered_charges,ratio_average_total_payments,ratio_average_medicare_payments)
+    
+remove(payment3)
+remove(DRG_State_avg)
+```
+
+```{r final merge}
+
+#final merge
+per_provider<- per_provider_state %>% 
+       left_join(per_provider_reg[,c(1,2,10:17)], by=c("DRG.Definition","Provider.Id"))
+remove(per_provider_reg)
+remove(per_provider_state)
+
+kable(summary(per_provider[,c(10:16)]))
+kable(summary(per_provider[,c(17:25)]))
+```
+
+## DBSCAN
+
+  DBSCAN is a clustering technique that starts at a specified or random point and groups observations together based on a measurement of proximity. In this case it is a diameter of a circle with the denter as the locaiton of the point. The algorithm continues to classify on cluster until it is forced to stop due to no remaining points within the set measurement of proximity. Then the algorithm picks another point and starts a new cluster. This process repeats until all points are clssified. Any points not grouped are outliers. 
+  
+  Here I will use DBSCAN on the mean_wide and max_wide and try to visualize the clusters.
+  
+```{r DBSCAN paramater tunning, message=FALSE, warning=FALSE}
+#Set sample parameters for DBSCAN
+n=20000
+MinPts=round(log(n)) # a common approach to setting minimum number of points without domain knowledge
+
+#create sample
+set.seed(123)
+samp<- sample(1:nrow(per_provider), n)
+
+#set numeric calumn index
+num_cols<-10:25
+
+#scale and make sure data is a df
+per_provider[,num_cols]<- scale(per_provider[,num_cols])
+per_provider<-per_provider%>%as.data.frame()
+
+#run PCA on data to identify which PC's to cluster on
+perp_PCA <- prcomp(per_provider[samp,num_cols])
+
+# find # of PC's to keep and select the top PC's for clustering that makes the total vatriance explained >90%
+v<-summary(perp_PCA) #store summary values
+i=0 # create step variable that will identify number of PC's
+sum_var<-0 #create stoping variable 
+while(sum_var<.9){
+  i=i+1
+  sum_var<-sum(v$importance[2,1:i])
+}
+
+#reduce PC's
+perp_PCA <-perp_PCA$x[,1:i]
+
+#look at elbow to set eps parameter
+dbscan::kNNdistplot(perp_PCA, k =  5)
+abline(h = 2.5, lty = 2) #set eps to 2.5 which is aproximately at elbow
+eps<-2.5
+```
+
+  I set my *MinPts* to log(n), *`r MinPts`*, where n is the number of observations, in this case 20,000. This is a common method to set this parameter without domain knowledge to guide this decision. I also limited my principle components (PC's) to *`r i`*, since that is the minimum number of PC's where the explained variance is greater than 90%. The plot above shows the elbow where I set my *eps* parameter. The elbow apears to be at or around *`r eps`*.  
+
+```{r DBSCAN model 1}
+# model 1 - DBSCAN 
+set.seed(123)
+per_provider_db <- fpc::dbscan(data = perp_PCA, eps = eps, MinPts = MinPts )
+
+#view cluster assignment
+  kable(table(per_provider_db$cluster),col.names  = c("Cluster", "Number Assigned"))
+```
+
+  The majority of observations have been identified into cluster 1 with about 1% in cluster 0. 
+
+```{r plot 1}
+#plot 1
+ggplot(perp_PCA%>%as.data.frame(), aes(x=PC1, y=PC3,  col=as.factor(per_provider_db$cluster)))+ 
+  geom_point(alpha=.4)+
+  mytheme+
+  labs(title="DBSCAN Results")+
+  scale_color_discrete(name="Cluster")
+```
+
+  This visual is very interesting as it shows most of the outliers to the extreme with few inside the majority, ot high density area of cluster 1.
+
+```{r plot 2, include=FALSE}
+#plot 2 - 3D plot to see better groupings, the clusters seem to be inside eachother almost like layers of an union
+pca3d(perp_PCA, group=as.factor(per_provider_db$cluster), show.ellipses=TRUE,
+ellipse.ci=0.75, show.plane=FALSE)
+snapshotPCA3d(file="DBSCAN.png")
+```
+
+  This interactive 3D plot helps to visualize the clusters using 3 PC's. The cluster is spearated pretty well and appears to be consistent. The knitr packages wont compile the plot but the code is here to run it if you wanted to try it.
+
+```{r plot 3, warning=FALSE, message=FALSE}
+#plot 3
+ggpairs(perp_PCA%>%as.data.frame(),
+        columns = colnames(perp_PCA),
+         mapping=ggplot2::aes(colour = as.factor(per_provider_db$cluster), alpha=.8),
+        lower=list(continuous='points'),
+        upper=list(continuous='blank'))
+```
+
+  The plot appears to have identified the two distributions pretty well as most scatter plots show cluster 0 on the outer boundaries of cluster 1. The distributions of both clusters are very different as well which makes me think this is a good clustering.
+
+```{rmodel 2, eval=FALSE, echo=FALSE}
+# model 2 - DBSCAN using optics()
+set.seed(1)
+op <- optics(perp_PCA,minPts = MinPts)
+opDBSCAN <- extractDBSCAN(op, eps_cl = eps)
+hullplot(perp_PCA, opDBSCAN, main = "OPTICS")
+
+table(opDBSCAN$cluster)
+
+```
+
+```{r model 3}
+
+# model 3 - Hierarchical DBSCAN 
+set.seed(1)
+per_provider_hdb <- hdbscan(perp_PCA, minPts=MinPts)
+
+table(per_provider_hdb$cluster)
+
+ggplot(perp_PCA%>%as.data.frame()%>% mutate(cluster = as.factor(per_provider_hdb$cluster)), aes(x=PC1%>%abs()%>%log(), y=PC2%>%abs()%>%log(),col=cluster))+
+  geom_point(alpha=.2)+
+  mytheme+
+  labs(title="HDBSCAN Results", x= "PC1", y="PC2")+
+  scale_color_discrete(name="Cluster")
+
+```
+```{r plot 4, warning=FALSE, message=FALSE}
+#plot 4 - 3D plot 
+pca3d(perp_PCA%>%abs()%>%log(), group=as.factor(per_provider_hdb$cluster), show.ellipses=TRUE,
+ellipse.ci=0.75, show.plane=FALSE)
+snapshotPCA3d(file="HDBSCAN.png")
+```
+
+```{r plot 5, warning=FALSE, message=FALSE}
+#plot 5
+ggpairs(perp_PCA%>%as.data.frame(),
+        columns = colnames(perp_PCA),
+         mapping=ggplot2::aes(colour = as.factor(per_provider_hdb$cluster), alpha=.8),
+        lower=list(continuous='points'),
+        upper=list(continuous='blank'))
+```
+  
+  The Hierarchical DBSCAN model is not as obviously useful. It appears that cluster 2 is a much denser area and has been clustered accordingly. However it is difficult to interpret the real reason why. I will keep model 1 for reporting outliers since the clusters are visualy different.
+  
+```{r plot 6 region map, include=FALSE}
+#need to plot each hospital and color by cluster
+
+V1 <- per_provider[samp,] %>% # aggregate procedures for each hospital
+  mutate(Hcluster=factor(per_provider_hdb$cluster))
+  
+#read in data for zipcode
+data(zipcode)
+
+# merge aggregated hospital data with zipcode, copy lat+lon for each hospital
+V2 <- merge(V1,zipcode, by.x= "Provider.Zip.Code", by.y= "zip")
+#V3 <- merge(V2,V1, by.x= "Provider.Zip.Code", by.y= "Provider.Zip.Code")
+
+p_region <- plot_geo(V2, locationmode = 'USA-states', sizes = c(1, 250)) %>%
+  add_markers(
+    x = ~longitude, y = ~latitude, alpha=.6,
+    color = ~V2$Hcluster, 
+    hoverinfo = "text",
+    text = ~paste(Provider.Name,  Provider.Id, sep = "\n")
+  ) %>%
+  layout(title = 'Aggregated Discharges at US Hospitals by Region <br>(Click legend to toggle)', geo = g,autosize = F, margin = m) # g is defiend above in constants section
+
+#display plot
+p_region
+
+
+```
+  
+```{r find optimal clusters, eval=FALSE, echo=FALSE}
+#parallel clustering in DBSCAN
+#http://worldcomp-proceedings.com/proc/p2016/PDP7562.pdf
+
+#decide useing traditional aggregation index where y= cut on dendrogram and x= #of clusters similar to a scree plot
+
+
+#trying to find optimal #of clusters through reachplots and dendrograms
+#https://pdfs.semanticscholar.org/0ad5/f3520ef1f806758699e9cbebec0c6df9ba98.pdf?_ga=2.185937134.656713208.1530810999-2107460980.1530810999
+
+
+#### Method 1 to set DBSCAN parameters ----
+#Set sample parameters for DBSCAN
+n=20000
+MinPts=round(log(n)) # a common approach to setting minimum number of points without domain knowledge
+
+#create sample
+set.seed(123)
+samp<- sample(1:nrow(per_provider), n)
+
+#set numeric calumn index
+num_cols<-10:25
+
+#scale and make sure data is a df
+per_provider[,num_cols]<- scale(per_provider[,num_cols])
+per_provider<-per_provider%>%as.data.frame()
+
+#run PCA on data to identify which PC's to cluster on
+perp_PCA <- prcomp(per_provider[samp,num_cols])
+
+# find # of PC's to keep and select the top PC's for clustering that makes the total vatriance explained >90%
+v<-summary(perp_PCA) #store summary values
+i=0 # create step variable that will identify number of PC's
+sum_var<-0 #create stoping variable 
+while(sum_var<.9){
+  i=i+1
+  sum_var<-sum(v$importance[2,1:i])
+}
+
+#reduce PC's
+perp_PCA <-perp_PCA$x[,1:i]
+
+#look at elbow to set eps parameter
+dbscan::kNNdistplot(perp_PCA, k =  5)
+abline(h = 2.5, lty = 2) #set eps to 2.5 which is aproximately at elbow
+eps<-2.5
+
+#### Method 2 to set DBSCAN parameters ----
+
+#run DBSCAN with optics()
+op <- optics(per_provider[samp,num_cols,minPts = MinPts)
+plot(op)
+head(op$)
+
+reach_p<- vector("numeric",length = (length(op$reachdist)-2))
+for (i in 2:(length(op$reachdist)-1)){
+  reach_p[i]<-(op$reachdist[i]/op$reachdist[i-1])/(op$reachdist[i]/op$reachdist[i+1])
+  }
+
+clust_sep<-vector("numeric",length = (length(reach_p)-2))
+clust_sep<-rep(NA,length(clust_sep))
+for (i in 2:(length(reach_p)-1)){  
+clust_sep[i]<-ifelse(mean(reach_p[1:(i-1)]) <= .75*reach_p[i] & mean(reach_p[(i+1):length(reach_p)]) <= .75*reach_p[i], 1,0)
+}
+sum(clust_sep,na.rm = T)
+#170 clusters
+clust_ass<- c(NA,clust_sep,NA)
+
+opDBSCAN <- extractDBSCAN(op, eps_cl = eps)
+hullplot(per_provider[1:n,num_cols], opDBSCAN, main = "OPTICS")
+
+opXi <- extractXi(op, xi = 0.05)
+hullplot(perp_PCA, opXi, main = "OPTICSXi")
+
+km <- kmeans(per_provider[1:n,num_cols], centers = 4,nstart = 10)
+hullplot(per_provider[1:n,9:12], km, main = "k-means")
+
+hc <- cutree(hclust(dist(per_provider[1:n,num_cols])), k = 4)
+hullplot(per_provider[1:n,num_cols], hc, main = "Hierarchical Clustering")
+
+
+table(as.numeric(per_provider_db$cluster))
+
+#looking for ggplot hclust plot
+
+per_provider_s_hc <- per_provider[1:n,num_cols] %>% dist() %>% hclust(method = "single") 
+per_provider_c_hc <- per_provider[1:n,num_cols] %>% dist() %>% hclust(method = "complete") 
+per_provider_a_hc <- per_provider[1:n,num_cols] %>% dist() %>% hclust(method = "average") 
+
+per_provider_den_s <- per_provider_s_hc %>% ggdendrogram() + labs(title="Single")
+per_provider_den_c <- per_provider_c_hc %>% ggdendrogram() + labs(title="Complete")
+per_provider_den_a <- per_provider_a_hc %>% ggdendrogram() + labs(title="Average")
+
+per_provider_den_s
+per_provider_den_c
+per_provider_den_a
+
+```
+
+## Hidden Morkov Model (HMM)
+
+  The Hidden Markov Model is one that assumes there are unknown distributions of multiple samples mixed into observed output. These models are often refered to as mixture models. The goal of the HMM is to identify these separate distributions and categorize the outputs into their respective groups. The underlying assumption is that the characteristics of each sample are significantly different than the others. 
+  
+```{r HMM}
+
+# Specify the model
+hmm <- depmix(data = data.frame(perp_PCA), 
+              response = list(PC1 ~ 1, PC2 ~ 1, PC3 ~ 1, PC4 ~ 1, PC5 ~ 1, PC6 ~ 1), 
+              family = list(gaussian(), gaussian(), gaussian(), gaussian(), gaussian(), gaussian()),  
+              nstates = 2 ) 
+# Fit the model by calling the "fit" function
+hmmfit <- fit(hmm, verbose = FALSE) 
+hmmfit 
+
+# plot posterior state sequence for the 2-state model
+post_probs <- posterior(hmmfit)
+head(post_probs)
+
+sum(ifelse(post_probs$S1>.5,1,0))
+
+#plot first 500 of HMM model
+layout(matrix(c(1,2), 2, 1, byrow = TRUE))
+# Plot the true regimes
+matplot(post_probs$state[1:200], type='l', main='True Regimes',xlab='', ylab='Regime')
+# Plot the probabilities of the regimes
+matplot(post_probs[1:200,-1], type='l', main='Regime Posterior Probabilities', ylab='Probability')
+legend(x='right', inset = 0,c('Regime #1','Regime #2'), fill=1:2, bty='n')
+
+```
+
+```{r}
+
+report<- data.frame(per_provider[samp,],DBClust= per_provider_db$cluster, HDBClust= per_provider_hdb$cluster, HMM=ifelse(post_probs$S1>.5,1,0))
+
+report<- report%>%arrange(Provider.Id, Provider.Name, DRG.Definition)
+
+kable(head(report[,c(1:3,26:28)]))
+```
+
